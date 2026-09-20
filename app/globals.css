@@ -1,0 +1,195 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: var(--font-inter), "Inter", ui-sans-serif, system-ui, -apple-system,
+    "Segoe UI", Roboto, sans-serif;
+  /* Reference design system: off-white canvas, white cards, 1px gray border */
+  --color-cream: #f5f6f0;
+  --color-cream-deep: #ecefe6;
+  --color-line: #e5e7eb;
+  /* Semantic accents */
+  --color-brand: #16b364; /* primary / positive / profit */
+  --color-brand-deep: #0e9b52;
+  --color-danger: #e5484d; /* negative / destructive */
+  --color-ink: #172033; /* primary text */
+  --color-sub: #6b7280; /* secondary text */
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  background: var(--color-cream);
+}
+
+/* Cleaner numeric inputs for POS screens */
+input[type="number"]::-webkit-outer-spin-button,
+input[type="number"]::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+input[type="number"] {
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+
+/* Elements that only exist for printing (e.g. barcode labels) */
+.print-only {
+  display: none;
+}
+
+/* The print area (receipt slips / barcode label) is only visible in
+   print media; the on-screen UI shows its own preview copy. */
+#print-area {
+  display: none;
+}
+
+/* ===== Thermal receipts (screen preview + print) =====
+   Fixed sheet widths at 96dpi: 80mm = 302px, 58mm = 220px.
+   Side padding keeps content inside the physically printable
+   area (~72mm on 80mm paper, ~48mm on 58mm). The .r-feed block
+   at the bottom leaves paper for the auto-cutter. */
+.r-sheet {
+  font-family: ui-monospace, "SF Mono", "Cascadia Mono", "Roboto Mono", Menlo,
+    Consolas, "Liberation Mono", monospace;
+  color: #000;
+  background: #fff;
+  line-height: 1.45;
+}
+.rw-80 {
+  width: 302px;
+  padding: 14px 15px 0;
+  font-size: 12.5px;
+}
+.rw-58 {
+  width: 220px;
+  padding: 12px 20px 0;
+  font-size: 10.5px;
+}
+.r-biz {
+  letter-spacing: 0.5px;
+}
+.rw-80 .r-biz { font-size: 15px; }
+.rw-58 .r-biz { font-size: 13px; }
+.r-kot-title {
+  margin-top: 2px;
+  letter-spacing: 2px;
+}
+.rw-80 .r-kot-title { font-size: 15px; }
+.rw-58 .r-kot-title { font-size: 13px; }
+.r-sep {
+  border-top: 1px dashed #000;
+  margin: 8px 0;
+}
+.r-block {
+  margin: 8px 0;
+}
+.r-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+.r-item {
+  margin-bottom: 8px;
+}
+.r-item-name {
+  font-weight: 700;
+  overflow-wrap: break-word;
+}
+.r-item-variant {
+  font-weight: 400;
+}
+.r-total {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  border-top: 1.5px solid #000;
+  margin-top: 8px;
+  padding-top: 6px;
+  font-weight: 700;
+}
+.rw-80 .r-total { font-size: 15px; }
+.rw-58 .r-total { font-size: 13px; }
+.r-kot-item {
+  margin-bottom: 12px;
+}
+.r-kot-line {
+  display: flex;
+  gap: 6px;
+  overflow-wrap: break-word;
+  font-size: 1.08em;
+}
+/* the "N ×" prefix must never split or shrink; the name takes the rest */
+.r-kot-line > span:first-child {
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.r-kot-name {
+  text-transform: uppercase;
+  flex: 1;
+  min-width: 0;
+}
+.r-kot-variant {
+  margin-left: 18px;
+}
+.r-kot-notes {
+  margin-top: 4px;
+}
+.r-footer {
+  margin-top: 8px;
+  font-size: 0.95em;
+}
+.r-feed {
+  height: 60px;
+}
+.rw-58 .r-feed {
+  height: 48px;
+}
+
+/* Receipt printing: show only the receipt area */
+@media print {
+  .print-only {
+    display: block;
+  }
+  body {
+    background: #fff;
+  }
+  body * {
+    visibility: hidden;
+  }
+  #print-area,
+  #print-area * {
+    visibility: visible;
+  }
+  #print-area {
+    display: block !important;
+    position: absolute;
+    top: 0;
+    left: 0;
+    /* width is owned by the receipt sheets (80mm = 302px, 58mm = 220px) */
+    margin: 0;
+    border: none !important;
+    box-shadow: none !important;
+    border-radius: 0 !important;
+  }
+  /* Dual receipt: customer slip = page 1, kitchen slip = page 2.
+     break-before (not break-after) avoids a trailing blank page. */
+  .receipt-page + .receipt-page {
+    break-before: page;
+  }
+  /* Per-printer targets: hide the slip that is not being printed
+     (e.g. kitchen slip to the kitchen printer only). */
+  #print-area.hide-kitchen .receipt-kitchen {
+    display: none;
+  }
+  #print-area.hide-customer .receipt-customer {
+    display: none;
+  }
+  .r-sheet {
+    border: none !important;
+    box-shadow: none !important;
+    border-radius: 0 !important;
+  }
+}
