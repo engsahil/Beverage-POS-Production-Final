@@ -23,15 +23,24 @@ import { query, withTransaction } from '@/lib/db';
 import { requireUser } from '@/lib/auth';
 import { getSettings } from '@/lib/settings';
 import { hasPermission } from '@/lib/permissions';
-import { readJson, str, toNumber, validDate, fail, ok, round2, HttpError } from '@/lib/validate';
+import { readJson, str, toNumber, validDate, fail, ok, okGzip, round2, HttpError } from '@/lib/validate';
 import { PRICING_MODES, normalizePricingMode, priceForMode, minForMode, summarizeModes } from '@/lib/pricing';
+import { dayGte, dayLte } from '@/lib/date-range';
+
+// Largest value that fits the NUMERIC(12,2) money columns. Sending more used
+// to blow up inside the sale transaction as an opaque 500; it is now rejected
+// up front with a clear 400 (same guard the product prices already use).
+const MAX_MONEY = 999999999.99;
 
 export async function GET(req) {
+  // Settings and auth are independent — start both so a remote database
+  // costs one round trip here instead of two.
+  const settingsPromise = getSettings();
   const auth = await requireUser();
   if (auth.error) return auth.error;
   const sp = req.nextUrl.searchParams;
   const isAdmin = auth.user.role === 'admin';
-  const settings = await getSettings();
+  const settings = await settingsPromise;
   const tz = settings.timezone;
 
   const from = validDate(sp.get('from'));
@@ -54,11 +63,11 @@ export async function GET(req) {
   }
   if (from) {
     params.push(tz, from);
-    where.push(`(s.created_at AT TIME ZONE $${params.length - 1})::date >= $${params.length}`);
+    where.push(dayGte('s.created_at', `$${params.length - 1}`, `$${params.length}`));
   }
   if (to) {
     params.push(tz, to);
-    where.push(`(s.created_at AT TIME ZONE $${params.length - 1})::date <= $${params.length}`);
+    where.push(dayLte('s.created_at', `$${params.length - 1}`, `$${params.length}`));
   }
   const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
 
@@ -76,7 +85,7 @@ export async function GET(req) {
       LIMIT 200`,
     params
   );
-  return ok({ sales: rows });
+  return okGzip({ sales: rows }, req);
 }
 
 const METHODS = ['cash', 'card', 'other'];
@@ -98,6 +107,9 @@ function dateStr(v) {
 }
 
 export async function POST(req) {
+  // Settings (business timezone, used for the expiry check) are needed on
+  // every sale; fetch them alongside the session instead of after it.
+  const settingsPromise = getSettings();
   const auth = await requireUser();
   if (auth.error) return auth.error;
 
@@ -132,12 +144,16 @@ export async function POST(req) {
     normalized.push({ productId, qty: round2(qty), variant: variantLabel, variantId, mode: lineModeRaw });
   }
 
-  const discount = toNumber(body.discount);
-  if (discount === null || discount < 0) return fail('Discount must be 0 or more.');
+  // An omitted discount simply means "no discount" — it must not reject the
+  // sale. A present-but-invalid value still does.
+  const discount =
+    body.discount === undefined || body.discount === null || body.discount === '' ? 0 : toNumber(body.discount);
+  if (discount === null || discount < 0 || discount > MAX_MONEY) return fail('Discount must be 0 or more.');
   const paymentMethod = METHODS.includes(body.paymentMethod) ? body.paymentMethod : null;
   if (!paymentMethod) return fail('Select a payment method.');
   const paid = toNumber(body.paid);
   if (paid === null || paid < 0) return fail('Enter the amount the customer paid.');
+  if (paid > MAX_MONEY) return fail(`The amount paid cannot exceed ${MAX_MONEY.toFixed(2)}.`);
   const customerName = str(body.customerName, { max: 80 }) ?? '';
   const customerPhone = str(body.customerPhone, { max: 30 }) ?? '';
   const customerId = body.customerId ? Number(body.customerId) : null;
@@ -158,7 +174,7 @@ export async function POST(req) {
   }
   if (customerId !== null && !Number.isInteger(customerId)) return fail('Invalid customer.');
 
-  const settings = await getSettings();
+  const settings = await settingsPromise;
   const tz = settings.timezone;
   const today = businessToday(tz);
 

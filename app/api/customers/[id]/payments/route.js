@@ -5,6 +5,7 @@ import { withTransaction } from '@/lib/db';
 import { requireUser } from '@/lib/auth';
 import { hasPermission } from '@/lib/permissions';
 import { readJson, toNumber, str, fail, ok, round2, HttpError } from '@/lib/validate';
+import { MAX_LEDGER_AMOUNT } from '@/lib/ledger';
 
 export async function POST(req, { params }) {
   const auth = await requireUser();
@@ -23,6 +24,7 @@ export async function POST(req, { params }) {
   const note = str(body.note, { max: 200 }) ?? '';
   const method = ['cash', 'bank', 'card'].includes(body.method) ? body.method : null;
   if (amount === null || amount <= 0) return fail('Enter an amount above zero.');
+  if (amount > MAX_LEDGER_AMOUNT) return fail(`The amount cannot exceed ${MAX_LEDGER_AMOUNT.toFixed(2)}.`);
   if (!method) return fail('Select the payment method (cash, bank or card).');
 
   try {

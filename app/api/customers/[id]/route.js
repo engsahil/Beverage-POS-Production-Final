@@ -3,7 +3,8 @@
 import { query } from '@/lib/db';
 import { requireUser } from '@/lib/auth';
 import { hasPermission } from '@/lib/permissions';
-import { readJson, str, fail, ok } from '@/lib/validate';
+import { readJson, str, fail, ok, round2 } from '@/lib/validate';
+import { ledgerTotals } from '@/lib/ledger';
 
 function canManage(user) {
   return hasPermission(user, 'customer_management');
@@ -16,28 +17,51 @@ export async function GET(req, { params }) {
   const customerId = Number(id);
   if (!Number.isInteger(customerId)) return fail('Invalid customer id.', 404);
 
-  const rows = await query(
-    `SELECT c.id, c.name, c.phone, c.address, c.notes, c.active, c.outstanding_balance, c.created_at
-       FROM customers c WHERE c.id = $1`,
-    [customerId]
-  );
+  // History is paginated instead of silently truncated: an account with more
+  // than one page of entries used to show only the newest 200 with no
+  // indication that older ones existed.
+  const sp = req.nextUrl.searchParams;
+  const limitRaw = Number(sp.get('limit') || 200);
+  const limit = Number.isInteger(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 500) : 200;
+  const beforeRaw = Number(sp.get('before'));
+  const before = Number.isInteger(beforeRaw) && beforeRaw > 0 ? beforeRaw : null;
+
+  const [rows, totalsRows, ledgerRows] = await Promise.all([
+    query(
+      `SELECT c.id, c.name, c.phone, c.address, c.notes, c.active, c.outstanding_balance, c.created_at
+         FROM customers c WHERE c.id = $1`,
+      [customerId]
+    ),
+    // Account totals straight from the ledger rows (source of truth).
+    ledgerTotals((sql, p) => query(sql, p), customerId),
+    query(
+      `SELECT ct.id, ct.type, ct.amount, ct.balance_after, ct.method, ct.ref_id, ct.note, ct.created_at,
+              u.full_name AS user_name,
+              s.sale_no
+         FROM customer_transactions ct
+         LEFT JOIN users u ON u.id = ct.created_by
+         LEFT JOIN sales s ON s.id = ct.ref_id AND ct.type = 'sale'
+        WHERE ct.customer_id = $1${before ? ' AND ct.id < $2' : ''}
+        ORDER BY ct.id DESC
+        LIMIT $${before ? 3 : 2}`,
+      before ? [customerId, before, limit + 1] : [customerId, limit + 1]
+    ),
+  ]);
   const customer = rows[0];
   if (!customer) return fail('Customer not found.', 404);
   if (!canManage(auth.user) && !customer.active) return fail('Customer not found.', 404);
 
-  const ledger = await query(
-    `SELECT ct.id, ct.type, ct.amount, ct.balance_after, ct.method, ct.ref_id, ct.note, ct.created_at,
-            u.full_name AS user_name,
-            s.sale_no
-       FROM customer_transactions ct
-       LEFT JOIN users u ON u.id = ct.created_by
-       LEFT JOIN sales s ON s.id = ct.ref_id AND ct.type = 'sale'
-      WHERE ct.customer_id = $1
-      ORDER BY ct.id DESC
-      LIMIT 200`,
-    [customerId]
-  );
-  return ok({ customer, ledger });
+  // One extra row is fetched only to know whether more history exists.
+  const hasMore = ledgerRows.length > limit;
+  const ledger = hasMore ? ledgerRows.slice(0, limit) : ledgerRows;
+  const totals = {
+    ...totalsRows,
+    outstanding: round2(Number(customer.outstanding_balance)),
+    // The stored balance must equal the sum of the ledger. Exposed rather
+    // than silently trusted, so drift is visible instead of hidden.
+    in_sync: round2(Number(customer.outstanding_balance)) === totalsRows.ledger_balance,
+  };
+  return ok({ customer, ledger, totals, hasMore });
 }
 
 export async function PUT(req, { params }) {

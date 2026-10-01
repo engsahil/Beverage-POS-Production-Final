@@ -3,9 +3,10 @@
 // POST /api/products -> create (admin), optionally with full variant rows
 import { query, withTransaction } from '@/lib/db';
 import { requireAdmin, requireUser } from '@/lib/auth';
-import { readJson, str, toNumber, validDate, fail, ok, round2 } from '@/lib/validate';
+import { readJson, str, toNumber, validDate, fail, ok, okGzip, round2 } from '@/lib/validate';
 import { parseImageData } from './image-data';
 import { parseVariants, syncVariants } from './variants';
+import { variantAggregate, stockValueExpr } from '@/lib/inventory';
 
 /**
  * Optional non-negative price. Blank / null / omitted => null ("not
@@ -79,15 +80,25 @@ export async function GET(req) {
             p.min_price_enabled, p.min_retail, p.min_wholesale, p.min_special,
             p.category_id, c.name AS category_name,
             (p.image_data IS NOT NULL) AS has_image,
-            (SELECT count(*) FROM product_variants vx WHERE vx.product_id = p.id AND vx.active) AS active_variants
+            v.active_variants,
+            -- Authoritative value at cost of this product, computed here so
+            -- every screen (POS, inventory, dashboard scope totals) sums the
+            -- same number the database does. Sized products use the sum of
+            -- their variants' stock x cost; plain products use their own.
+            ${stockValueExpr('p', 'v')} AS stock_value
        FROM products p
        LEFT JOIN categories c ON c.id = p.category_id
+       ${variantAggregate('p', 'v')}
        ${whereSql}
       ORDER BY p.name
       LIMIT 1000`,
     params
   );
-  return ok({ products: await attachVariants(rows) });
+  for (const r of rows) {
+    r.active_variants = Number(r.active_variants);
+    r.stock_value = Number(r.stock_value);
+  }
+  return okGzip({ products: await attachVariants(rows) }, req);
 }
 
 export async function POST(req) {

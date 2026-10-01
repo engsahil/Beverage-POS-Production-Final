@@ -103,15 +103,25 @@ export default function PosClient({ user, settings, priceLimits = null }) {
     (v) => Boolean(v?.expiry_date) && String(v.expiry_date).slice(0, 10) < today,
     [today]
   );
+  // Id -> product index. The cart re-derives every line's price and minimum
+  // on each render, so a linear `products.find` per line turned a keystroke
+  // into O(cart x catalogue) work. The map is rebuilt only when the
+  // catalogue itself changes.
+  const productById = useMemo(() => {
+    const m = new Map();
+    for (const p of products || []) m.set(p.id, p);
+    return m;
+  }, [products]);
+
   // The product/size row behind a cart line (for price derivation).
   const lineSource = useCallback(
     (item) => {
-      const p = products && products.find((x) => x.id === item.id);
+      const p = productById.get(item.id);
       if (!p) return null;
       if (item.variantId) return (p.variants || []).find((x) => x.id === item.variantId) || null;
       return p;
     },
-    [products]
+    [productById]
   );
 
   // Live unit price of a cart line: its OWN pricing mode (default retail),
@@ -136,8 +146,8 @@ export default function PosClient({ user, settings, priceLimits = null }) {
   // (admin-configured per product/variant + mode, ON/OFF). null = not set
   // or protection OFF at both levels.
   const itemMinFor = (item, m) => {
-    if (!products || !item) return null;
-    const p = products.find((x) => x.id === item.id);
+    if (!item) return null;
+    const p = productById.get(item.id);
     if (!p) return null;
     let min = minForMode(p, m);
     if (item.variantId) {

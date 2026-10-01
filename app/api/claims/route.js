@@ -4,7 +4,7 @@
 // no automatic stock changes (use Inventory > Adjust if needed).
 import { query } from '@/lib/db';
 import { requireAdmin } from '@/lib/auth';
-import { readJson, str, toNumber, validDate, fail, ok, round2 } from '@/lib/validate';
+import { readJson, str, toNumber, validDate, fail, ok, okGzip, round2 } from '@/lib/validate';
 
 export async function GET(req) {
   const auth = await requireAdmin();
@@ -25,7 +25,7 @@ export async function GET(req) {
       LIMIT 200`,
     params
   );
-  return ok({ claims: rows });
+  return okGzip({ claims: rows }, req);
 }
 
 export async function POST(req) {

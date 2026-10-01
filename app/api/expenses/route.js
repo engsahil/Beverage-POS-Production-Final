@@ -6,7 +6,7 @@
 // Legacy rows have method = NULL and are shown as "unspecified".
 import { query } from '@/lib/db';
 import { requireAdmin } from '@/lib/auth';
-import { readJson, str, toNumber, validDate, fail, ok, round2 } from '@/lib/validate';
+import { readJson, str, toNumber, validDate, fail, ok, okGzip, round2 } from '@/lib/validate';
 
 export const EXPENSE_CATEGORIES = [
   'Rent',
@@ -61,7 +61,7 @@ export async function GET(req) {
       LIMIT 500`,
     params
   );
-  return ok({ expenses: rows.map((r) => ({ ...r, amount: Number(r.amount) })) });
+  return okGzip({ expenses: rows.map((r) => ({ ...r, amount: Number(r.amount) })) }, req);
 }
 
 export async function POST(req) {

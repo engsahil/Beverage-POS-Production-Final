@@ -3,7 +3,7 @@
 import { query } from '@/lib/db';
 import { requireUser } from '@/lib/auth';
 import { hasPermission } from '@/lib/permissions';
-import { readJson, str, fail, ok } from '@/lib/validate';
+import { readJson, str, fail, ok, okGzip } from '@/lib/validate';
 
 export async function GET(req) {
   const auth = await requireUser();
@@ -28,7 +28,7 @@ export async function GET(req) {
       LIMIT 500`,
     params
   );
-  return ok({ customers: rows });
+  return okGzip({ customers: rows }, req);
 }
 
 export async function POST(req) {
