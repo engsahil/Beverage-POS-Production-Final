@@ -23,15 +23,24 @@ import { query, withTransaction } from '@/lib/db';
 import { requireUser } from '@/lib/auth';
 import { getSettings } from '@/lib/settings';
 import { hasPermission } from '@/lib/permissions';
-import { readJson, str, toNumber, validDate, fail, ok, round2, HttpError } from '@/lib/validate';
+import { readJson, str, toNumber, validDate, fail, ok, okGzip, round2, HttpError } from '@/lib/validate';
 import { PRICING_MODES, normalizePricingMode, priceForMode, minForMode, summarizeModes } from '@/lib/pricing';
+import { dayGte, dayLte } from '@/lib/date-range';
+
+// Largest value that fits the NUMERIC(12,2) money columns. Sending more used
+// to blow up inside the sale transaction as an opaque 500; it is now rejected
+// up front with a clear 400 (same guard the product prices already use).
+const MAX_MONEY = 999999999.99;
 
 export async function GET(req) {
+  // Settings and auth are independent — start both so a remote database
+  // costs one round trip here instead of two.
+  const settingsPromise = getSettings();
   const auth = await requireUser();
   if (auth.error) return auth.error;
   const sp = req.nextUrl.searchParams;
   const isAdmin = auth.user.role === 'admin';
-  const settings = await getSettings();
+  const settings = await settingsPromise;
   const tz = settings.timezone;
 
   const from = validDate(sp.get('from'));
@@ -54,11 +63,11 @@ export async function GET(req) {
   }
   if (from) {
     params.push(tz, from);
-    where.push(`(s.created_at AT TIME ZONE $${params.length - 1})::date >= $${params.length}`);
+    where.push(dayGte('s.created_at', `$${params.length - 1}`, `$${params.length}`));
   }
   if (to) {
     params.push(tz, to);
-    where.push(`(s.created_at AT TIME ZONE $${params.length - 1})::date <= $${params.length}`);
+    where.push(dayLte('s.created_at', `$${params.length - 1}`, `$${params.length}`));
   }
   const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
 
@@ -76,7 +85,7 @@ export async function GET(req) {
       LIMIT 200`,
     params
   );
-  return ok({ sales: rows });
+  return okGzip({ sales: rows }, req);
 }
 
 const METHODS = ['cash', 'card', 'other'];
@@ -98,6 +107,9 @@ function dateStr(v) {
 }
 
 export async function POST(req) {
+  // Settings (business timezone, used for the expiry check) are needed on
+  // every sale; fetch them alongside the session instead of after it.
+  const settingsPromise = getSettings();
   const auth = await requireUser();
   if (auth.error) return auth.error;
 
@@ -132,12 +144,16 @@ export async function POST(req) {
     normalized.push({ productId, qty: round2(qty), variant: variantLabel, variantId, mode: lineModeRaw });
   }
 
-  const discount = toNumber(body.discount);
-  if (discount === null || discount < 0) return fail('Discount must be 0 or more.');
+  // An omitted discount simply means "no discount" — it must not reject the
+  // sale. A present-but-invalid value still does.
+  const discount =
+    body.discount === undefined || body.discount === null || body.discount === '' ? 0 : toNumber(body.discount);
+  if (discount === null || discount < 0 || discount > MAX_MONEY) return fail('Discount must be 0 or more.');
   const paymentMethod = METHODS.includes(body.paymentMethod) ? body.paymentMethod : null;
   if (!paymentMethod) return fail('Select a payment method.');
   const paid = toNumber(body.paid);
   if (paid === null || paid < 0) return fail('Enter the amount the customer paid.');
+  if (paid > MAX_MONEY) return fail(`The amount paid cannot exceed ${MAX_MONEY.toFixed(2)}.`);
   const customerName = str(body.customerName, { max: 80 }) ?? '';
   const customerPhone = str(body.customerPhone, { max: 30 }) ?? '';
   const customerId = body.customerId ? Number(body.customerId) : null;
@@ -158,7 +174,7 @@ export async function POST(req) {
   }
   if (customerId !== null && !Number.isInteger(customerId)) return fail('Invalid customer.');
 
-  const settings = await getSettings();
+  const settings = await settingsPromise;
   const tz = settings.timezone;
   const today = businessToday(tz);
 
@@ -422,22 +438,62 @@ export async function POST(req) {
       // Sequential invoice number from the serial id: 00001, 00002, ...
       // The serial guarantees uniqueness under concurrency (gaps are
       // possible after rollbacks, duplicates are not).
-      const no = await client.query(`SELECT lpad($1::text, 5, '0') AS no`, [id]);
-      await client.query('UPDATE sales SET sale_no = $1 WHERE id = $2', [no.rows[0].no, id]);
+      // One statement instead of a SELECT lpad(...) followed by an UPDATE:
+      // the number is derived from the id either way, and a round trip to a
+      // database in another region costs ~20 ms.
+      const noRes = await client.query(
+        `UPDATE sales SET sale_no = lpad(id::text, 5, '0') WHERE id = $1 RETURNING sale_no`,
+        [id]
+      );
+      const no = { rows: [{ no: noRes.rows[0].sale_no }] };
 
       // 4) Item lines (one per cart line, keeping its size/variant),
       // then ONE stock decrease + ONE movement per base product (even when
       // several sizes of the same product are in the sale), plus the
       // per-variant stock decreases.
-      for (const l of lines) {
+      // ONE multi-row INSERT for every line (was one round trip per line).
+      {
+        const params = [];
+        const ph = [];
+        for (const l of lines) {
+          params.push(id, l.id, l.name, l.qty, l.price, l.variant, l.variantId, l.mode);
+          const n = params.length;
+          ph.push(`($${n - 7}, $${n - 6}, $${n - 5}, $${n - 4}, $${n - 3}, $${n - 2}, $${n - 1}, $${n})`);
+        }
         await client.query(
-          'INSERT INTO sale_items (sale_id, product_id, name, qty, unit_price, variant, variant_id, pricing_mode) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)',
-          [id, l.id, l.name, l.qty, l.price, l.variant, l.variantId, l.mode]
+          `INSERT INTO sale_items
+             (sale_id, product_id, name, qty, unit_price, variant, variant_id, pricing_mode)
+           VALUES ${ph.join(', ')}`,
+          params
         );
       }
-      for (const pid of productIds) {
+      // ONE statement per table instead of one per product/variant. These
+      // three loops used to cost 2-3 round trips per distinct product; with a
+      // database in another region that was the dominant cost of checkout.
+      //
+      // The values written are identical to the previous per-row version:
+      //   products.stock          -= the product's total qty
+      //   stock_movements          one row per product, with the same note and
+      //                            the same variant_id (the size when the
+      //                            product sold exactly one size, else null)
+      //   product_variants.stock  -= each size's own total qty
+      // The old code had two separate branches for the variant deduction
+      // (single-size and mixed-size sales). Both reduce to "deduct each size
+      // by its own accumulated qty": in the single-size case that size's
+      // accumulated qty IS the product total, so one rule covers both.
+      const pids = productIds.map(Number);
+      await client.query(
+        `UPDATE products AS p
+            SET stock = p.stock - d.qty, updated_at = now()
+           FROM unnest($1::int[], $2::numeric[]) AS d(id, qty)
+          WHERE p.id = d.id`,
+        [pids, pids.map((pid) => qtyById[pid])]
+      );
+
+      const mvParams = [];
+      const mvPh = [];
+      for (const pid of pids) {
         const need = qtyById[pid];
-        // human-readable note: which sizes went out with this sale
         const sold = lines.filter((l) => l.id === pid);
         const sizeNote = sold
           .filter((l) => l.variant)
@@ -445,34 +501,26 @@ export async function POST(req) {
           .join(', ');
         const soldVariantIds = [...new Set(sold.map((l) => l.variantId))];
         const singleVariant = soldVariantIds.length === 1 && soldVariantIds[0] ? soldVariantIds[0] : null;
-        await client.query('UPDATE products SET stock = stock - $1, updated_at = now() WHERE id = $2', [
-          need,
-          pid,
-        ]);
-        await client.query(
-          `INSERT INTO stock_movements (product_id, variant_id, change, reason, ref_id, note, created_by)
-           VALUES ($1, $2, $3, 'sale', $4, $5, $6)`,
-          [pid, singleVariant || null, -need, id, sizeNote, auth.user.id]
-        );
-        if (singleVariant) {
-          await client.query('UPDATE product_variants SET stock = stock - $1, updated_at = now() WHERE id = $2', [
-            need,
-            singleVariant,
-          ]);
-        }
+        mvParams.push(pid, singleVariant, -need, id, sizeNote, auth.user.id);
+        const n = mvParams.length;
+        mvPh.push(`($${n - 5}, $${n - 4}, $${n - 3}, 'sale', $${n - 2}, $${n - 1}, $${n})`);
       }
-      // Mixed-size sales: deduct each variant by its own total.
-      for (const [vid, need] of Object.entries(qtyByVariant)) {
-        const v = variantById.get(Number(vid));
-        const pid = productOfVariant[vid];
-        const sold = lines.filter((l) => l.id === pid);
-        const soldVariantIds = [...new Set(sold.map((l) => l.variantId))];
-        if (soldVariantIds.length > 1) {
-          await client.query('UPDATE product_variants SET stock = stock - $1, updated_at = now() WHERE id = $2', [
-            need,
-            Number(vid),
-          ]);
-        }
+      await client.query(
+        `INSERT INTO stock_movements
+           (product_id, variant_id, change, reason, ref_id, note, created_by)
+         VALUES ${mvPh.join(', ')}`,
+        mvParams
+      );
+
+      const vids = Object.keys(qtyByVariant).map(Number);
+      if (vids.length) {
+        await client.query(
+          `UPDATE product_variants AS v
+              SET stock = v.stock - d.qty, updated_at = now()
+             FROM unnest($1::int[], $2::numeric[]) AS d(id, qty)
+            WHERE v.id = d.id`,
+          [vids, vids.map((vid) => qtyByVariant[vid])]
+        );
       }
 
       // 5) Customer credit ledger (same transaction as the sale).

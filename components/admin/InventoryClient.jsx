@@ -2,9 +2,10 @@
 // Inventory: current stock, low stock, adjustments and movement history.
 import { useCallback, useEffect, useState } from 'react';
 import { api } from '@/lib/api-client';
-import { formatMoney, formatDate, formatTime, formatQty } from '@/lib/format';
+import { formatMoney, formatDate, formatTime, formatQty, round2 } from '@/lib/format';
 import { useToast } from '@/components/Toast';
 import { Badge, Button, Card, DataTable, ErrorBox, Loading, Modal, PageHeader, Input, Select } from '@/components/ui';
+import { productStockValue } from '@/lib/inventory';
 
 /** Walk back from current stock to get the stock AFTER each movement (movements are newest first). */
 function resultingStocks(movements, currentStock) {
@@ -22,8 +23,10 @@ export default function InventoryClient({ settings }) {
   const tz = settings?.timezone;
 
   const [products, setProducts] = useState(null);
+  const [categories, setCategories] = useState([]);
   const [error, setError] = useState('');
   const [filter, setFilter] = useState('all'); // all | out | low | expiring | expired
+  const [categoryId, setCategoryId] = useState(''); // '' = every category
   const [adjust, setAdjust] = useState(null); // product
   const [adjustVariantId, setAdjustVariantId] = useState(''); // size for sized products
   const [history, setHistory] = useState(null); // { product, movements }
@@ -35,8 +38,12 @@ export default function InventoryClient({ settings }) {
 
   const load = useCallback(async () => {
     try {
-      const d = await api('/api/products');
+      const [d, c] = await Promise.all([
+        api('/api/products'),
+        api('/api/categories').catch(() => ({ categories: [] })),
+      ]);
       setProducts(d.products);
+      setCategories(c.categories || []);
       setError('');
     } catch (err) {
       if (err.status === 401) {
@@ -58,9 +65,17 @@ export default function InventoryClient({ settings }) {
     return d.toISOString().slice(0, 10);
   })();
   const active = (products || []).filter((p) => p.active);
-  const lowCount = active.filter((p) => Number(p.stock) <= Number(p.min_stock)).length;
-  const outCount = active.filter((p) => Number(p.stock) <= 0).length;
-  const stockValue = active.reduce((s, p) => s + Number(p.stock) * Number(p.cost), 0);
+  // Value at cost comes from the server (products.stock_value): a sized
+  // product contributes the sum of its variants' stock x cost, a plain
+  // product its own stock x cost. Doing this on the client used
+  // product.stock x product.cost, which is 0 for most sized products, so the
+  // inventory total silently ignored every size.
+  const valueOf = (p) =>
+    p.stock_value === undefined || p.stock_value === null ? productStockValue(p) : Number(p.stock_value);
+  const inCategory = categoryId ? active.filter((p) => String(p.category_id) === categoryId) : active;
+  const lowCount = inCategory.filter((p) => Number(p.stock) <= Number(p.min_stock)).length;
+  const outCount = inCategory.filter((p) => Number(p.stock) <= 0).length;
+  const stockValue = round2(inCategory.reduce((s, p) => s + valueOf(p), 0));
 
   // Expiry dates a product contributes: its own (plain products) or its
   // sizes' dates (sized products).
@@ -72,9 +87,9 @@ export default function InventoryClient({ settings }) {
         : [];
   const isExpired = (p) => expiryDates(p).some((d) => d < today);
   const isExpiring = (p) => !isExpired(p) && expiryDates(p).some((d) => d <= in30);
-  const expiredCount = active.filter(isExpired).length;
+  const expiredCount = inCategory.filter(isExpired).length;
 
-  const visible = active.filter((p) => {
+  const visible = inCategory.filter((p) => {
     if (filter === 'out') return Number(p.stock) <= 0;
     if (filter === 'low') return Number(p.stock) > 0 && Number(p.stock) <= Number(p.min_stock);
     if (filter === 'expired') return isExpired(p);
@@ -165,6 +180,10 @@ export default function InventoryClient({ settings }) {
                       <span className="font-medium text-stone-700">{v.name}</span>
                       <span className="tabular-nums">stock {formatQty(v.stock)}</span>
                       <span className="tabular-nums">min {formatQty(v.min_stock)}</span>
+                      <span className="tabular-nums">cost {formatMoney(v.cost, currency)}</span>
+                      <span className="tabular-nums">
+                        value {formatMoney(round2(Number(v.stock || 0) * Number(v.cost || 0)), currency)}
+                      </span>
                       {vd && (
                         <span className={vd < today ? 'text-red-600' : vd <= in30 ? 'text-amber-600' : ''}>exp {vd}</span>
                       )}
@@ -204,8 +223,27 @@ export default function InventoryClient({ settings }) {
           <Badge tone="ok">OK</Badge>
         ),
     },
-    { key: 'cost', label: 'Unit Cost', align: 'right', className: 'tabular-nums', render: (r) => formatMoney(r.cost, currency) },
-    { key: 'value', label: 'Value', align: 'right', className: 'tabular-nums', render: (r) => formatMoney(Number(r.stock) * Number(r.cost), currency) },
+    {
+      key: 'cost',
+      label: 'Unit Cost',
+      align: 'right',
+      className: 'tabular-nums',
+      // A sized product has one cost per size, so the row shows the
+      // stock-weighted average (unit cost x stock = value, up to rounding).
+      render: (r) => {
+        const vs = r.variants || [];
+        if (vs.length === 0) return formatMoney(r.cost, currency);
+        const stock = Number(r.stock) || 0;
+        return formatMoney(stock > 0 ? round2(valueOf(r) / stock) : 0, currency);
+      },
+    },
+    {
+      key: 'value',
+      label: 'Value',
+      align: 'right',
+      className: 'tabular-nums',
+      render: (r) => formatMoney(valueOf(r), currency),
+    },
     {
       key: 'actions',
       label: '',
@@ -232,7 +270,14 @@ export default function InventoryClient({ settings }) {
 
       <div className="grid grid-cols-3 gap-3 mb-4">
         <div className="bg-white border border-line rounded-lg p-4">
-          <div className="text-xs font-medium text-stone-500">Stock value (cost)</div>
+          <div className="text-xs font-medium text-stone-500">
+            Stock value (cost)
+            {categoryId ? (
+              <span className="block text-[11px] font-normal text-stone-400">
+                {categories.find((c) => String(c.id) === categoryId)?.name || 'selected category'} only
+              </span>
+            ) : null}
+          </div>
           <div className="mt-1 text-lg font-semibold tabular-nums">{formatMoney(stockValue, currency)}</div>
         </div>
         <div className="bg-white border border-line rounded-lg p-4">
@@ -261,6 +306,19 @@ export default function InventoryClient({ settings }) {
           <option value="low">Low stock</option>
           <option value="expired">Expired</option>
           <option value="expiring">Expiring within 30 days</option>
+        </select>
+        <label className="text-xs font-medium text-stone-600 ml-2">Category</label>
+        <select
+          value={categoryId}
+          onChange={(e) => setCategoryId(e.target.value)}
+          className="rounded-md border border-stone-300 bg-white px-2.5 py-1.5 text-sm text-stone-700 focus:outline-none focus:ring-2 focus:ring-stone-900/15"
+        >
+          <option value="">All categories</option>
+          {categories.map((c) => (
+            <option key={c.id} value={c.id}>
+              {c.name}
+            </option>
+          ))}
         </select>
       </div>
 

@@ -2,9 +2,9 @@
 // POST /api/vendors -> create (admin)
 import { query } from '@/lib/db';
 import { requireAdmin } from '@/lib/auth';
-import { readJson, str, fail, ok } from '@/lib/validate';
+import { readJson, str, fail, ok, okGzip } from '@/lib/validate';
 
-export async function GET() {
+export async function GET(req) {
   const auth = await requireAdmin();
   if (auth.error) return auth.error;
   const rows = await query(
@@ -15,7 +15,7 @@ export async function GET() {
        FROM vendors v
       ORDER BY v.name`
   );
-  return ok({ vendors: rows.map((r) => ({ ...r, outstanding: Number(r.outstanding) })) });
+  return okGzip({ vendors: rows.map((r) => ({ ...r, outstanding: Number(r.outstanding) })) }, req);
 }
 
 export async function POST(req) {

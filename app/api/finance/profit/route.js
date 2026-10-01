@@ -8,6 +8,7 @@ import { query } from '@/lib/db';
 import { requireAdmin } from '@/lib/auth';
 import { getSettings } from '@/lib/settings';
 import { validDate, fail, ok, round2 } from '@/lib/validate';
+import { dayGte, dayLte } from '@/lib/date-range';
 
 export async function GET(req) {
   const auth = await requireAdmin();
@@ -30,7 +31,7 @@ export async function GET(req) {
     query(
       `SELECT COALESCE(SUM(s.total), 0) AS total
          FROM sales s
-        WHERE (s.created_at AT TIME ZONE $1)::date BETWEEN $2 AND $3`,
+        WHERE ${dayGte('s.created_at', '$1', '$2')} AND ${dayLte('s.created_at', '$1', '$3')}`,
       [settings.timezone, f, t]
     ),
     query(
@@ -39,7 +40,7 @@ export async function GET(req) {
          JOIN sales s ON s.id = si.sale_id
          JOIN products p ON p.id = si.product_id
          LEFT JOIN product_variants v ON v.id = si.variant_id
-        WHERE (s.created_at AT TIME ZONE $1)::date BETWEEN $2 AND $3`,
+        WHERE ${dayGte('s.created_at', '$1', '$2')} AND ${dayLte('s.created_at', '$1', '$3')}`,
       [settings.timezone, f, t]
     ),
     query(
@@ -52,7 +53,8 @@ export async function GET(req) {
     query(
       `SELECT COALESCE(SUM(vc.amount), 0) AS total
          FROM vendor_claims vc
-        WHERE vc.status = 'settled' AND (vc.settled_at AT TIME ZONE $1)::date BETWEEN $2 AND $3`,
+        WHERE vc.status = 'settled'
+          AND ${dayGte('vc.settled_at', '$1', '$2')} AND ${dayLte('vc.settled_at', '$1', '$3')}`,
       [settings.timezone, f, t]
     ),
   ]);

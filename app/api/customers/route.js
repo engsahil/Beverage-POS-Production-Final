@@ -3,7 +3,7 @@
 import { query } from '@/lib/db';
 import { requireUser } from '@/lib/auth';
 import { hasPermission } from '@/lib/permissions';
-import { readJson, str, fail, ok } from '@/lib/validate';
+import { readJson, str, fail, ok, okGzip } from '@/lib/validate';
 
 export async function GET(req) {
   const auth = await requireUser();
@@ -20,15 +20,22 @@ export async function GET(req) {
     where.push(`(LOWER(c.name) LIKE $${params.length} OR LOWER(c.phone) LIKE $${params.length})`);
   }
   const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  // The POS customer picker shows name / phone / balance only. Address, notes
+  // and created_at are free-text columns that made up most of this payload and
+  // are never read on that screen. Default response unchanged for admin.
+  const fields =
+    sp.get('view') === 'pos'
+      ? 'c.id, c.name, c.phone, c.active, c.outstanding_balance'
+      : 'c.id, c.name, c.phone, c.address, c.notes, c.active, c.outstanding_balance, c.created_at';
   const rows = await query(
-    `SELECT c.id, c.name, c.phone, c.address, c.notes, c.active, c.outstanding_balance, c.created_at
+    `SELECT ${fields}
        FROM customers c
        ${whereSql}
       ORDER BY c.name
       LIMIT 500`,
     params
   );
-  return ok({ customers: rows });
+  return okGzip({ customers: rows }, req);
 }
 
 export async function POST(req) {

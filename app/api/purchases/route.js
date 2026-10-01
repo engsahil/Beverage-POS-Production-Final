@@ -4,7 +4,7 @@
 import { query, withTransaction } from '@/lib/db';
 import { requireAdmin } from '@/lib/auth';
 import { getSettings } from '@/lib/settings';
-import { readJson, str, toNumber, validDate, fail, ok, round2, HttpError } from '@/lib/validate';
+import { readJson, str, toNumber, validDate, fail, ok, okGzip, round2, HttpError } from '@/lib/validate';
 
 // Shared payment summary + status for a purchase row.
 // Status: paid | partially_paid | unpaid | overdue (overdue = money still
@@ -65,7 +65,7 @@ export async function GET(req) {
       LIMIT 200`,
     params
   );
-  return ok({ purchases: rows.map((r) => purchaseStatus(r, today)) });
+  return okGzip({ purchases: rows.map((r) => purchaseStatus(r, today)) }, req);
 }
 
 export async function POST(req) {

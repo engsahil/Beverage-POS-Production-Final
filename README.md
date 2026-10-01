@@ -175,3 +175,24 @@ public/             manifest.webmanifest, sw.js, icons
 | `npm run db:migrate` | Apply additive schema migrations |
 | `npm run db:seed` | Create the two initial accounts (if missing) |
 | `npm run icons` | Regenerate PWA icons (Python 3 + Pillow) |
+
+---
+
+## Production audit (2026-10-01)
+
+A full audit of total-cost aggregation, the customer ledger and deployed performance is
+documented in [`AUDIT-REPORT.md`](./AUDIT-REPORT.md): root causes, the fixes, and the
+verification that was actually run.
+
+Reproduce the verification:
+
+```bash
+node scripts/migrate.mjs                     # 001–009, additive only
+node scripts/seed.mjs
+npm run build && npm start                   # then, in another shell:
+BASE_URL=http://127.0.0.1:3000 node scripts/smoke.mjs                       # 203 assertions
+DATABASE_URL=... BASE_URL=http://127.0.0.1:3000 node scripts/e2e/total-cost-ledger.mjs   # 71
+DATABASE_URL=... BASE_URL=http://127.0.0.1:3000 node scripts/e2e/perf-audit.mjs          # perf
+```
+
+`scripts/smoke.mjs` is not idempotent — run it against a fresh database.

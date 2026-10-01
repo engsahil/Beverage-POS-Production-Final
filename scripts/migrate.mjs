@@ -23,6 +23,7 @@ const MIGRATIONS = [
   { name: '006_pricing_modes_cashier_limits', file: 'db/schema-006.sql' },
   { name: '007_per_line_pricing_modes', file: 'db/schema-007.sql' },
   { name: '008_product_variant_min_prices', file: 'db/schema-008.sql' },
+  { name: '009_ledger_types_and_indexes', file: 'db/schema-009.sql' },
 ];
 
 const db = new pg.Client({ connectionString: process.env.DATABASE_URL });

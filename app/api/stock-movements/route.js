@@ -1,7 +1,7 @@
 // GET /api/stock-movements?productId=1&limit=50 (admin)
 import { query } from '@/lib/db';
 import { requireAdmin } from '@/lib/auth';
-import { fail, ok } from '@/lib/validate';
+import { fail, ok, okGzip } from '@/lib/validate';
 
 export async function GET(req) {
   const auth = await requireAdmin();
@@ -21,5 +21,5 @@ export async function GET(req) {
       LIMIT $2`,
     [productId, limit]
   );
-  return ok({ movements: rows });
+  return okGzip({ movements: rows }, req);
 }

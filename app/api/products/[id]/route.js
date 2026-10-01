@@ -113,14 +113,24 @@ export async function PUT(req, { params }) {
   const variants = parseVariants(body.variants, { allowId: true });
   if (variants.error) return fail(variants.error);
   if (variants.value) {
-    for (const v of variants.value) {
-      if (!v.barcode) continue;
-      const dupe = await query(
-        `SELECT id FROM products WHERE barcode = $1
-         UNION ALL SELECT id FROM product_variants WHERE barcode = $1 AND id <> COALESCE($2::int, 0)`,
-        [v.barcode, v.id]
+    // ONE query for all sizes (was one per size). A size keeps its own
+    // barcode when the product is edited, so the row being edited is excluded.
+    const codes = variants.value.filter((v) => v.barcode).map((v) => v.barcode);
+    const ids = variants.value.filter((v) => v.barcode).map((v) => v.id || 0);
+    if (codes.length) {
+      const dupes = await query(
+        `SELECT b.code
+           FROM unnest($1::text[], $2::int[]) AS b(code, vid)
+          WHERE EXISTS (SELECT 1 FROM products WHERE barcode = b.code)
+             OR EXISTS (SELECT 1 FROM product_variants
+                         WHERE barcode = b.code AND id <> b.vid)`,
+        [codes, ids]
       );
-      if (dupe.length > 0) return fail(`Size "${v.name}": that barcode is already in use.`, 409);
+      if (dupes.length) {
+        const hit = new Set(dupes.map((d) => d.code));
+        const first = variants.value.find((v) => v.barcode && hit.has(v.barcode));
+        return fail(`Size "${first.name}": that barcode is already in use.`, 409);
+      }
     }
   }
 

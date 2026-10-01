@@ -60,6 +60,13 @@ export async function POST(req) {
           return res.rows[0].id;
         };
 
+        // Validate every row first, then insert in batches. The old code ran
+        // one INSERT (plus one stock_movements INSERT) per row inside the
+        // transaction, so a 500-row import made ~1000 database round trips -
+        // invisible on localhost, but roughly 20 seconds against a database in
+        // another region. Validation order is unchanged, so the same row
+        // produces the same error message.
+        const prepared = [];
         for (const r of toInsert) {
           if (dupes.has(keyFor(entity, r))) {
             skipped++;
@@ -75,41 +82,97 @@ export async function POST(req) {
               errors: [{ row: 0, message: `min_price cannot exceed price (${r.name})` }],
             });
           }
-          const categoryId = await resolveCat(r.category);
+          prepared.push({
+            row: r,
+            price,
+            cost,
+            stock,
+            minStock,
+            minPrice,
+          });
+        }
+
+        const CHUNK = 100;
+        for (let i = 0; i < prepared.length; i += CHUNK) {
+          const slice = prepared.slice(i, i + CHUNK);
+          // Categories are resolved per slice (resolveCat caches, so a repeat
+          // name costs nothing after the first lookup).
+          for (const p of slice) p.categoryId = await resolveCat(p.row.category);
+
+          const params = [];
+          const ph = [];
+          for (const p of slice) {
+            params.push(
+              p.row.name,
+              p.row.barcode || null,
+              p.categoryId,
+              p.price,
+              p.cost,
+              p.stock,
+              p.minStock,
+              p.minPrice,
+              parseDate(p.row.expiry_date || '')
+            );
+            const n = params.length;
+            ph.push(
+              `($${n - 8}, $${n - 7}, $${n - 6}, $${n - 5}, $${n - 4}, $${n - 3}, $${n - 2}, $${n - 1}, $${n})`
+            );
+          }
           const ins = await client.query(
             `INSERT INTO products (name, barcode, category_id, price, cost, stock, min_stock, min_price, expiry_date)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
-            [r.name, r.barcode || null, categoryId, price, cost, stock, minStock, minPrice, parseDate(r.expiry_date || '')]
+             VALUES ${ph.join(', ')} RETURNING id, stock`,
+            params
           );
-          inserted++;
-          if (stock > 0) {
+          inserted += ins.rows.length;
+
+          // Opening stock movements for the rows that actually carry stock,
+          // in ONE statement (the ids come back from the insert above).
+          const withStock = ins.rows.filter((r) => Number(r.stock) > 0);
+          if (withStock.length) {
+            const mParams = [];
+            const mPh = [];
+            for (const r of withStock) {
+              mParams.push(r.id, Number(r.stock), auth.user.id);
+              const n = mParams.length;
+              mPh.push(`($${n - 2}, $${n - 1}, 'adjustment', 'CSV import', $${n})`);
+            }
             await client.query(
               `INSERT INTO stock_movements (product_id, change, reason, note, created_by)
-               VALUES ($1, $2, 'adjustment', 'CSV import', $3)`,
-              [ins.rows[0].id, stock, auth.user.id]
+               VALUES ${mPh.join(', ')}`,
+              mParams
             );
           }
         }
       } else if (entity === 'customers') {
-        for (const r of toInsert) {
-          if (dupes.has(keyFor(entity, r))) {
-            skipped++;
-            continue;
+        const rowsC = toInsert.filter((r) => !dupes.has(keyFor(entity, r)));
+        skipped += toInsert.length - rowsC.length;
+        for (let i = 0; i < rowsC.length; i += 100) {
+          const slice = rowsC.slice(i, i + 100);
+          const params = [];
+          const ph = [];
+          for (const r of slice) {
+            params.push(r.name, r.phone || '', r.address || '', r.notes || '');
+            const n = params.length;
+            ph.push(`($${n - 3}, $${n - 2}, $${n - 1}, $${n})`);
           }
           await client.query(
-            'INSERT INTO customers (name, phone, address, notes) VALUES ($1, $2, $3, $4)',
-            [r.name, r.phone || '', r.address || '', r.notes || '']
+            `INSERT INTO customers (name, phone, address, notes) VALUES ${ph.join(', ')}`,
+            params
           );
-          inserted++;
+          inserted += slice.length;
         }
       } else {
-        for (const r of toInsert) {
-          if (dupes.has(keyFor(entity, r))) {
-            skipped++;
-            continue;
-          }
-          await client.query('INSERT INTO vendors (name) VALUES ($1)', [r.name]);
-          inserted++;
+        const rowsV = toInsert.filter((r) => !dupes.has(keyFor(entity, r)));
+        skipped += toInsert.length - rowsV.length;
+        for (let i = 0; i < rowsV.length; i += 100) {
+          const slice = rowsV.slice(i, i + 100);
+          // Placeholders restart at $1 for every chunk, matching the params
+          // array passed with it.
+          await client.query(
+            `INSERT INTO vendors (name) VALUES ${slice.map((_, k) => `($${k + 1})`).join(', ')}`,
+            slice.map((r) => r.name)
+          );
+          inserted += slice.length;
         }
       }
 

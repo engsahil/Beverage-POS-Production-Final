@@ -5,7 +5,8 @@ import { query } from '@/lib/db';
 import { requireUser } from '@/lib/auth';
 import { hasPermission } from '@/lib/permissions';
 import { getSettings } from '@/lib/settings';
-import { validDate, fail, ok } from '@/lib/validate';
+import { validDate, fail, ok, okGzip } from '@/lib/validate';
+import { dayGte, dayLte } from '@/lib/date-range';
 
 export async function GET(req) {
   const auth = await requireUser();
@@ -26,11 +27,11 @@ export async function GET(req) {
   const params = [tz];
   if (from) {
     params.push(from);
-    where.push(`(s.created_at AT TIME ZONE $1)::date >= $${params.length}`);
+    where.push(dayGte('s.created_at', '$1', `$${params.length}`));
   }
   if (to) {
     params.push(to);
-    where.push(`(s.created_at AT TIME ZONE $1)::date <= $${params.length}`);
+    where.push(dayLte('s.created_at', '$1', `$${params.length}`));
   }
   const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
 
@@ -149,5 +150,5 @@ export async function GET(req) {
   for (const d of map.values()) if (d.expenses === undefined) d.expenses = 0;
 
   const days = [...map.values()].sort((a, b) => (a.date < b.date ? 1 : -1));
-  return ok({ days });
+  return okGzip({ days }, req);
 }
