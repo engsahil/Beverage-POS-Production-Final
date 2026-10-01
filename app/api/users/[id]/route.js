@@ -72,11 +72,18 @@ export async function PUT(req, { params }) {
     }
     const list = [...new Set(body.permissions)];
     await query('DELETE FROM user_permissions WHERE user_id = $1', [target.id]);
-    for (const perm of list) {
-      await query('INSERT INTO user_permissions (user_id, permission) VALUES ($1, $2)', [
-        target.id,
-        perm,
-      ]);
+    // ONE multi-row insert (was one round trip per permission).
+    if (list.length) {
+      const params = [];
+      const ph = [];
+      for (const perm of list) {
+        params.push(target.id, perm);
+        ph.push(`($${params.length - 1}, $${params.length})`);
+      }
+      await query(
+        `INSERT INTO user_permissions (user_id, permission) VALUES ${ph.join(', ')}`,
+        params
+      );
     }
   }
 

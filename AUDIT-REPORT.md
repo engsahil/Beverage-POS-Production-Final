@@ -283,3 +283,122 @@ overstated:
    before release.
 4. `scripts/smoke.mjs` is not idempotent — it creates fixed names, so a second run against the
    same database fails on `409 already exists`. Run it against a fresh database.
+
+---
+
+# Round 2 — lightweight pass (2026-10-01)
+
+A second pass focused on round trips, payload size and frontend rendering,
+after the first round had already fixed the total-cost rule, the ledger and the
+dashboard/report queries.
+
+## 9. The dominant production cost of checkout
+
+`scripts/e2e/checkout-perf.mjs` (new) builds a real 4-line sale — two plain
+products plus two sizes of one sized product — and counts the statements the
+single `POST /api/sales` request executes.
+
+```
+BEFORE:  39 statements, wall p50 456.4 ms   (20 ms RTT database)
+AFTER :  30 statements, wall p50 249.6 ms   (-45%)
+```
+
+Of those 39, **18 were foreign-key `FOR KEY SHARE` checks** that PostgreSQL runs
+inside the parent INSERT — they ride along on the same round trip and cost no
+extra latency. The application itself issued **21 round trips**, and 456 ms /
+21 ≈ 21.7 ms, i.e. the wall time was *entirely* network round trips. On
+localhost the same code is fast, which is exactly why this only shows up after
+deployment.
+
+What changed (identical values written, fewer trips):
+
+| Before | After |
+| --- | --- |
+| `SELECT lpad(id,5,'0')` then `UPDATE sales SET sale_no` | one `UPDATE … SET sale_no = lpad(id::text,5,'0') … RETURNING` |
+| one `INSERT INTO sale_items` **per cart line** | one multi-row INSERT |
+| one `UPDATE products SET stock` **per product** | one `UPDATE … FROM unnest(ids[], qtys[])` |
+| one `INSERT INTO stock_movements` **per product** | one multi-row INSERT |
+| one `UPDATE product_variants SET stock` **per size** | one `UPDATE … FROM unnest(…)` |
+
+The old code had two separate branches for the variant deduction (single-size
+and mixed-size sales). Both reduce to "deduct each size by its own accumulated
+quantity" — in the single-size case that size's accumulated quantity *is* the
+product total — so one rule now covers both. This equivalence is asserted by the
+203-assertion smoke suite (stock levels, one movement per sale, variant sales)
+and the 71-assertion acceptance suite, both re-run after the change.
+
+## 10. Three more N+1 write paths
+
+| Path | Before | After |
+| --- | --- | --- |
+| `PUT /api/users/:id` (permissions) | one INSERT **per permission** | one multi-row INSERT |
+| `POST /api/products`, `PUT /api/products/:id` (barcode uniqueness) | one query **per size** | one `unnest()` query for all sizes |
+| `POST /api/import/apply` | one INSERT (+ one stock movement) **per CSV row** | validated up front, then 100-row batched INSERTs with a single batched stock-movement insert |
+
+A 500-row CSV import previously made ~1000 round trips inside one transaction —
+roughly 20 seconds against a remote database. Validation order is unchanged, so
+the same row still produces the same error.
+
+## 11. POS payload: only the fields the screen reads
+
+`GET /api/products?view=pos` and `GET /api/customers?view=pos` return a
+projection derived from what `components/pos/PosClient.jsx` and `lib/pricing.js`
+actually read — not guessed. The POS never shows cost, stock value, category
+names or the purchasing fields (reorder level, batch, supplier, tax), and it
+filters by `category_id` from the category list it already has, so the category
+join and the variant-aggregate lateral are not executed at all.
+
+```
+/api/products    630.0 KB -> 436.5 KB   (-30.7%)     gzipped 42 KB -> 26 KB
+/api/customers    33.6 KB ->  20.9 KB   (-37.6%)
+POS open total   663.6 KB -> 457.4 KB   (-31.1%)     p50 147.9 -> 131.6 ms
+```
+
+The default response is unchanged, so no admin screen or existing caller is
+affected. The projection is verified at runtime: every field the POS and the
+pricing module read is present, the heavy unused fields are gone, and a real
+sale built from projection data is accepted (201).
+
+## 12. POS grid: mounted cards were the per-keystroke cost
+
+The grid rendered **every** matching product — 819 cards on the audited
+catalogue — recomputing prices, expiry and stock badges for each on every
+keystroke and category change. It now mounts 60 at a time, resetting when the
+filter changes, with a "Show more" control and an always-visible
+"Showing N of M (catalogue: T)". Search and the category filter still cover the
+whole catalogue; nothing is hidden, only not mounted.
+
+## 13. Investigated and deliberately not changed
+
+* **Bundle size is not a problem.** First Load JS is 103 kB base / 103–118 kB
+  per route; the only heavy dependency, `jsbarcode`, is already behind a dynamic
+  import in the one screen that uses it. There is nothing to tree-shake or split
+  that would be measurable.
+* **No unused dependencies, components or modules.** Every entry in
+  `package.json` is used (`react-dom` is a Next.js peer; `tailwindcss`/`postcss`
+  are build-time), and a scan found no component or `lib/` module that nothing
+  imports. Nothing was removed because nothing was unused.
+* **A session+settings query merge was tried and reverted** — see §4. Profiling
+  showed Next.js instantiates the module twice per request, so React's `cache()`
+  never dedupes and the statement count does not drop.
+* **The POS still loads the whole catalogue** rather than paging it. That is a
+  deliberate trade: it keeps search and add-to-cart instant and offline-capable,
+  and the projection plus the render cap remove the cost that mattered. A
+  catalogue of tens of thousands of items would want server-side paging, and
+  `?search=` / `?categoryId=` are already there to support it.
+
+## 14. Verification for round 2
+
+| Check | Result |
+| --- | --- |
+| `npm run build` | ✓ Compiled successfully |
+| `scripts/smoke.mjs` on a virgin database | **203 passed, 0 failed** |
+| `scripts/e2e/total-cost-ledger.mjs` | **71 passed, 0 failed** |
+| `scripts/e2e/checkout-perf.mjs` | 456.4 ms → 249.6 ms, 39 → 30 statements |
+| POS-view field audit | every required field present; sale from projection accepted |
+| Payload sizes (identity + gzip via `curl`) | −30.7% products, −37.6% customers |
+
+The same environment limitations from §7 still apply: no browser automation
+(Playwright will not download here), so the grid change is verified by build and
+code review rather than by driving a real browser; and remote-database latency is
+modelled with a 20 ms TCP proxy rather than a real Neon instance.

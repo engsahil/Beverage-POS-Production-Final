@@ -17,6 +17,11 @@ const METHODS = [
   { key: 'other', label: 'Other' },
 ];
 
+// Cards mounted per "page" of the product grid. Chosen so the whole first
+// screen plus a little scroll is already there, while a large catalogue does
+// not put thousands of DOM nodes in the tree.
+const GRID_PAGE = 60;
+
 export default function PosClient({ user, settings, priceLimits = null }) {
   const router = useRouter();
   const toast = useToast();
@@ -51,6 +56,12 @@ export default function PosClient({ user, settings, priceLimits = null }) {
   const [closingCash, setClosingCash] = useState('');
   const [shiftSubmitting, setShiftSubmitting] = useState(false);
   const [closeResult, setCloseResult] = useState(null);
+  // How many product cards are actually mounted. The catalogue can hold
+  // thousands of items; mounting every card on each keystroke is the single
+  // most expensive thing the POS screen does. Search and the category filter
+  // still cover the WHOLE catalogue — this only limits how many cards are in
+  // the DOM at once, and the true total is always shown.
+  const [visibleCount, setVisibleCount] = useState(GRID_PAGE);
   const [showAddCustomer, setShowAddCustomer] = useState(false);
   const [newCustomer, setNewCustomer] = useState({ name: '', phone: '' });
   const searchRef = useRef(null);
@@ -64,9 +75,11 @@ export default function PosClient({ user, settings, priceLimits = null }) {
     async (fresh = false) => {
       await withStatus(async () => {
         const [p, c, cu, sh] = await Promise.all([
-          api('/api/products', { fresh }),
+          // view=pos: the POS projection (no cost / stock value / category
+          // name / purchasing fields) — same rows, same order, fewer bytes.
+          api('/api/products?view=pos', { fresh }),
           api('/api/categories', { fresh }),
-          api('/api/customers', { fresh }).catch(() => ({ customers: [] })),
+          api('/api/customers?view=pos', { fresh }).catch(() => ({ customers: [] })),
           api('/api/shifts', { fresh }).catch(() => ({ shifts: [] })),
         ]);
       setProducts(p.products);
@@ -94,6 +107,16 @@ export default function PosClient({ user, settings, priceLimits = null }) {
         (!q || p.name.toLowerCase().includes(q) || (p.barcode && p.barcode.toLowerCase().includes(q)))
     );
   }, [products, search, categoryId]);
+
+  // Reset the render window when the filter changes, then slice it. Both are
+  // cheap compared to mounting the cards themselves.
+  useEffect(() => {
+    setVisibleCount(GRID_PAGE);
+  }, [search, categoryId]);
+  const visibleProducts = useMemo(
+    () => (filtered.length > visibleCount ? filtered.slice(0, visibleCount) : filtered),
+    [filtered, visibleCount]
+  );
 
   // "Today" in the STORE timezone — must match the server's expiry check
   // (which also uses the store timezone), whatever the machine clock says.
@@ -642,7 +665,7 @@ export default function PosClient({ user, settings, priceLimits = null }) {
             <div className="py-16 text-center text-sm text-stone-400">No products found.</div>
           ) : (
             <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-3">
-              {filtered.map((p) => {
+              {visibleProducts.map((p) => {
                 const stock = Number(p.stock);
                 const out = stock <= 0;
                 const expired = isExpired(p);
@@ -702,6 +725,23 @@ export default function PosClient({ user, settings, priceLimits = null }) {
                   </button>
                 );
               })}
+            </div>
+          )}
+          {products && filtered.length > 0 && (
+            <div className="px-1 pt-3 pb-1 text-center">
+              <div className="text-xs text-stone-400">
+                Showing {Math.min(visibleCount, filtered.length)} of {filtered.length}
+                {filtered.length !== (products || []).length && ` (catalogue: ${(products || []).length})`}
+              </div>
+              {filtered.length > visibleCount && (
+                <button
+                  type="button"
+                  onClick={() => setVisibleCount((n) => n + GRID_PAGE)}
+                  className="mt-2 px-4 py-2 rounded-md border border-stone-300 bg-white text-sm font-medium text-stone-700 hover:bg-cream/70"
+                >
+                  Show {Math.min(GRID_PAGE, filtered.length - visibleCount)} more
+                </button>
+              )}
             </div>
           )}
         </main>

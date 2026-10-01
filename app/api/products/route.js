@@ -25,6 +25,27 @@ function optPrice(value) {
   return { absent: false, value: n };
 }
 
+/**
+ * Field projection for the POS screen.
+ *
+ * The POS sells; it never shows cost, stock value, category names or the
+ * purchasing fields (reorder level, batch, supplier, tax). Sending them anyway
+ * cost ~190 kB of the ~630 kB catalogue payload on every POS open. Admin
+ * screens keep the full row — the default response is unchanged, so no
+ * existing caller breaks. `?view=pos` opts in.
+ *
+ * The list is derived from what components/pos/PosClient.jsx and
+ * lib/pricing.js actually read, not guessed.
+ */
+const POS_PRODUCT_FIELDS = `p.id, p.name, p.barcode, p.price, p.stock, p.min_stock,
+            p.min_price, p.wholesale_price, p.special_price, p.expiry_date, p.active,
+            p.min_price_enabled, p.min_retail, p.min_wholesale, p.min_special,
+            p.category_id, (p.image_data IS NOT NULL) AS has_image`;
+
+const POS_VARIANT_FIELDS = `v.product_id, v.id, v.name, v.price, v.wholesale_price, v.special_price,
+         v.discount_pct, v.stock, v.active, v.barcode, v.expiry_date,
+         v.min_price_enabled, v.min_retail, v.min_wholesale, v.min_special`;
+
 const VARIANT_SELECT = `
   SELECT v.product_id, v.id, v.name, v.unit, v.sku, v.barcode, v.price, v.wholesale_price, v.retail_price,
          v.special_price, v.cost, v.tax_rate, v.discount_pct, v.stock, v.min_stock, v.reorder_level,
@@ -33,10 +54,15 @@ const VARIANT_SELECT = `
          (v.image_data IS NOT NULL) AS has_image, v.image_mime
     FROM product_variants v`;
 
-async function attachVariants(products) {
+async function attachVariants(products, fields = null) {
   if (!products.length) return products;
+  // Ordering is by sort_order/id regardless of which columns are selected, so
+  // a projection cannot change the order sizes appear in.
+  const select = fields
+    ? `SELECT ${fields} FROM product_variants v`
+    : VARIANT_SELECT;
   const rows = await query(
-    `${VARIANT_SELECT} WHERE v.product_id = ANY($1::int[]) ORDER BY v.product_id, v.sort_order, v.id`,
+    `${select} WHERE v.product_id = ANY($1::int[]) ORDER BY v.product_id, v.sort_order, v.id`,
     [products.map((p) => p.id)]
   );
   const byProduct = new Map();
@@ -74,6 +100,23 @@ export async function GET(req) {
     );
   }
   const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const posView = sp.get('view') === 'pos';
+
+  if (posView) {
+    // No category join and no variant aggregate lateral: the POS filters by
+    // category_id (it already has the category list) and never shows a value
+    // at cost, so that work is simply not done.
+    const rows = await query(
+      `SELECT ${POS_PRODUCT_FIELDS}
+         FROM products p
+         ${whereSql}
+        ORDER BY p.name
+        LIMIT 1000`,
+      params
+    );
+    return okGzip({ products: await attachVariants(rows, POS_VARIANT_FIELDS) }, req);
+  }
+
   const rows = await query(
     `SELECT p.id, p.name, p.barcode, p.price, p.cost, p.stock, p.min_stock,
             p.min_price, p.wholesale_price, p.special_price, p.expiry_date, p.active,
@@ -178,14 +221,24 @@ export async function POST(req) {
     const dupe = await query('SELECT id FROM product_variants WHERE barcode = $1', [barcode]);
     if (dupe.length > 0) return fail('That barcode is already used by a size.', 409);
   }
-  for (const v of variantList) {
-    if (!v.barcode) continue;
-    const dupe = await query(
-      `SELECT id FROM products WHERE barcode = $1
-       UNION ALL SELECT id FROM product_variants WHERE barcode = $1`,
-      [v.barcode]
-    );
-    if (dupe.length > 0) return fail(`Size "${v.name}": that barcode is already in use.`, 409);
+  // ONE query for every size's barcode (was one round trip per size, so a
+  // product with 5 sizes cost 5 trips before the insert even started).
+  {
+    const codes = variantList.filter((v) => v.barcode).map((v) => v.barcode);
+    if (codes.length) {
+      const dupes = await query(
+        `SELECT b.code
+           FROM unnest($1::text[]) AS b(code)
+          WHERE EXISTS (SELECT 1 FROM products WHERE barcode = b.code)
+             OR EXISTS (SELECT 1 FROM product_variants WHERE barcode = b.code)`,
+        [codes]
+      );
+      if (dupes.length) {
+        const hit = new Set(dupes.map((d) => d.code));
+        const first = variantList.find((v) => v.barcode && hit.has(v.barcode));
+        return fail(`Size "${first.name}": that barcode is already in use.`, 409);
+      }
+    }
   }
 
   const bodyStock = body.stock === undefined || body.stock === null || body.stock === '' ? 0 : toNumber(body.stock);

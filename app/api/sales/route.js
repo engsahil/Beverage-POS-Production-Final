@@ -438,22 +438,62 @@ export async function POST(req) {
       // Sequential invoice number from the serial id: 00001, 00002, ...
       // The serial guarantees uniqueness under concurrency (gaps are
       // possible after rollbacks, duplicates are not).
-      const no = await client.query(`SELECT lpad($1::text, 5, '0') AS no`, [id]);
-      await client.query('UPDATE sales SET sale_no = $1 WHERE id = $2', [no.rows[0].no, id]);
+      // One statement instead of a SELECT lpad(...) followed by an UPDATE:
+      // the number is derived from the id either way, and a round trip to a
+      // database in another region costs ~20 ms.
+      const noRes = await client.query(
+        `UPDATE sales SET sale_no = lpad(id::text, 5, '0') WHERE id = $1 RETURNING sale_no`,
+        [id]
+      );
+      const no = { rows: [{ no: noRes.rows[0].sale_no }] };
 
       // 4) Item lines (one per cart line, keeping its size/variant),
       // then ONE stock decrease + ONE movement per base product (even when
       // several sizes of the same product are in the sale), plus the
       // per-variant stock decreases.
-      for (const l of lines) {
+      // ONE multi-row INSERT for every line (was one round trip per line).
+      {
+        const params = [];
+        const ph = [];
+        for (const l of lines) {
+          params.push(id, l.id, l.name, l.qty, l.price, l.variant, l.variantId, l.mode);
+          const n = params.length;
+          ph.push(`($${n - 7}, $${n - 6}, $${n - 5}, $${n - 4}, $${n - 3}, $${n - 2}, $${n - 1}, $${n})`);
+        }
         await client.query(
-          'INSERT INTO sale_items (sale_id, product_id, name, qty, unit_price, variant, variant_id, pricing_mode) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)',
-          [id, l.id, l.name, l.qty, l.price, l.variant, l.variantId, l.mode]
+          `INSERT INTO sale_items
+             (sale_id, product_id, name, qty, unit_price, variant, variant_id, pricing_mode)
+           VALUES ${ph.join(', ')}`,
+          params
         );
       }
-      for (const pid of productIds) {
+      // ONE statement per table instead of one per product/variant. These
+      // three loops used to cost 2-3 round trips per distinct product; with a
+      // database in another region that was the dominant cost of checkout.
+      //
+      // The values written are identical to the previous per-row version:
+      //   products.stock          -= the product's total qty
+      //   stock_movements          one row per product, with the same note and
+      //                            the same variant_id (the size when the
+      //                            product sold exactly one size, else null)
+      //   product_variants.stock  -= each size's own total qty
+      // The old code had two separate branches for the variant deduction
+      // (single-size and mixed-size sales). Both reduce to "deduct each size
+      // by its own accumulated qty": in the single-size case that size's
+      // accumulated qty IS the product total, so one rule covers both.
+      const pids = productIds.map(Number);
+      await client.query(
+        `UPDATE products AS p
+            SET stock = p.stock - d.qty, updated_at = now()
+           FROM unnest($1::int[], $2::numeric[]) AS d(id, qty)
+          WHERE p.id = d.id`,
+        [pids, pids.map((pid) => qtyById[pid])]
+      );
+
+      const mvParams = [];
+      const mvPh = [];
+      for (const pid of pids) {
         const need = qtyById[pid];
-        // human-readable note: which sizes went out with this sale
         const sold = lines.filter((l) => l.id === pid);
         const sizeNote = sold
           .filter((l) => l.variant)
@@ -461,34 +501,26 @@ export async function POST(req) {
           .join(', ');
         const soldVariantIds = [...new Set(sold.map((l) => l.variantId))];
         const singleVariant = soldVariantIds.length === 1 && soldVariantIds[0] ? soldVariantIds[0] : null;
-        await client.query('UPDATE products SET stock = stock - $1, updated_at = now() WHERE id = $2', [
-          need,
-          pid,
-        ]);
-        await client.query(
-          `INSERT INTO stock_movements (product_id, variant_id, change, reason, ref_id, note, created_by)
-           VALUES ($1, $2, $3, 'sale', $4, $5, $6)`,
-          [pid, singleVariant || null, -need, id, sizeNote, auth.user.id]
-        );
-        if (singleVariant) {
-          await client.query('UPDATE product_variants SET stock = stock - $1, updated_at = now() WHERE id = $2', [
-            need,
-            singleVariant,
-          ]);
-        }
+        mvParams.push(pid, singleVariant, -need, id, sizeNote, auth.user.id);
+        const n = mvParams.length;
+        mvPh.push(`($${n - 5}, $${n - 4}, $${n - 3}, 'sale', $${n - 2}, $${n - 1}, $${n})`);
       }
-      // Mixed-size sales: deduct each variant by its own total.
-      for (const [vid, need] of Object.entries(qtyByVariant)) {
-        const v = variantById.get(Number(vid));
-        const pid = productOfVariant[vid];
-        const sold = lines.filter((l) => l.id === pid);
-        const soldVariantIds = [...new Set(sold.map((l) => l.variantId))];
-        if (soldVariantIds.length > 1) {
-          await client.query('UPDATE product_variants SET stock = stock - $1, updated_at = now() WHERE id = $2', [
-            need,
-            Number(vid),
-          ]);
-        }
+      await client.query(
+        `INSERT INTO stock_movements
+           (product_id, variant_id, change, reason, ref_id, note, created_by)
+         VALUES ${mvPh.join(', ')}`,
+        mvParams
+      );
+
+      const vids = Object.keys(qtyByVariant).map(Number);
+      if (vids.length) {
+        await client.query(
+          `UPDATE product_variants AS v
+              SET stock = v.stock - d.qty, updated_at = now()
+             FROM unnest($1::int[], $2::numeric[]) AS d(id, qty)
+            WHERE v.id = d.id`,
+          [vids, vids.map((vid) => qtyByVariant[vid])]
+        );
       }
 
       // 5) Customer credit ledger (same transaction as the sale).
