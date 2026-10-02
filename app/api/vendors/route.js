@@ -9,13 +9,16 @@ export async function GET(req) {
   if (auth.error) return auth.error;
   const rows = await query(
     `SELECT v.id, v.name, v.phone, v.notes, v.active, v.created_at,
-            COALESCE((SELECT SUM(pr.total) FROM purchases pr WHERE pr.vendor_id = v.id), 0)
+            COALESCE(v.opening_balance, 0) AS opening_balance,
+            v.opening_balance_note, v.opening_balance_date,
+            COALESCE(v.opening_balance, 0)
+              + COALESCE((SELECT SUM(pr.total) FROM purchases pr WHERE pr.vendor_id = v.id), 0)
               - COALESCE((SELECT SUM(pp.amount) FROM purchase_payments pp WHERE pp.vendor_id = v.id), 0)
               AS outstanding
        FROM vendors v
       ORDER BY v.name`
   );
-  return okGzip({ vendors: rows.map((r) => ({ ...r, outstanding: Number(r.outstanding) })) }, req);
+  return okGzip({ vendors: rows.map((r) => ({ ...r, opening_balance: Number(r.opening_balance), outstanding: Number(r.outstanding) })) }, req);
 }
 
 export async function POST(req) {

@@ -1,15 +1,15 @@
 'use client';
-// Purchase detail: invoice + payment history + attachment.
-// Payments can be partial (any number); overpaying beyond the remaining
-// balance is blocked server-side. The attachment belongs to the purchase,
-// so editing payments never affects it.
+// Purchase detail: invoice + payment history + attachment + transactional edit.
+// The edit reverses the old stock effect and applies the new one in one
+// transaction, so final stock is exactly the new lines (never old + new).
+// Vendor ledger, payables, reports and dashboard update automatically.
 import { useCallback, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { api } from '@/lib/api-client';
 import {  formatMoney, formatDate, formatTime, formatQty, localDateStr , storeDateStr } from '@/lib/format';
 import { useToast } from '@/components/Toast';
-import { Button, Card, DataTable, ErrorBox, Loading, PageHeader, Badge, Input, Select, Field } from '@/components/ui';
-import { IconPlus, IconUpload, IconTrash, IconDownload } from '@/components/icons';
+import { Button, Card, DataTable, ErrorBox, Loading, Modal, PageHeader, Badge, Input, Select, Field } from '@/components/ui';
+import { IconPlus, IconPencil, IconUpload, IconTrash, IconDownload } from '@/components/icons';
 
 const STATUS = {
   paid: { label: 'Paid', tone: 'ok' },
@@ -29,6 +29,16 @@ export default function PurchaseDetailClient({ purchaseId, settings }) {
   const [saving, setSaving] = useState(false);
   const [attBusy, setAttBusy] = useState(false);
   const fileRef = useRef(null);
+
+  // Edit purchase state
+  const [showEdit, setShowEdit] = useState(false);
+  const [vendors, setVendors] = useState([]);
+  const [products, setProducts] = useState([]);
+  const [editVendorId, setEditVendorId] = useState('');
+  const [editDate, setEditDate] = useState('');
+  const [editNotes, setEditNotes] = useState('');
+  const [editLines, setEditLines] = useState([]);
+  const [editSaving, setEditSaving] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -62,6 +72,88 @@ export default function PurchaseDetailClient({ purchaseId, settings }) {
 
   const { purchase, items, payments, remaining } = data;
   const st = STATUS[purchase.status] || STATUS.unpaid;
+
+  async function openEdit() {
+    try {
+      const [v, p] = await Promise.all([api('/api/vendors'), api('/api/products')]);
+      setVendors(v.vendors.filter((x) => x.active));
+      setProducts(p.products.filter((x) => x.active));
+      setEditVendorId(String(purchase.vendor_id));
+      setEditDate(String(purchase.purchase_date).slice(0, 10));
+      setEditNotes(purchase.notes || '');
+      setEditLines(items.map((it) => ({
+        productId: String(it.product_id || ''),
+        variantId: it.variant_id ? String(it.variant_id) : '',
+        qty: String(it.qty),
+        cost: String(it.cost),
+        batchNo: it.batch_no || '',
+        expiryDate: it.expiry_date ? String(it.expiry_date).slice(0, 10) : '',
+      })));
+      if (items.length === 0) setEditLines([{ productId: '', variantId: '', qty: '', cost: '', batchNo: '', expiryDate: '' }]);
+      setShowEdit(true);
+    } catch (err) {
+      toast(err.message, 'error');
+    }
+  }
+
+  function setEditLine(i, key, value) {
+    setEditLines((prev) => prev.map((l, idx) => {
+      if (idx !== i) return l;
+      const next = { ...l, [key]: value };
+      if (key === 'productId') next.variantId = '';
+      return next;
+    }));
+  }
+  function addEditLine() {
+    setEditLines((prev) => [...prev, { productId: '', variantId: '', qty: '', cost: '', batchNo: '', expiryDate: '' }]);
+  }
+  function removeEditLine(i) {
+    setEditLines((prev) => (prev.length === 1 ? prev : prev.filter((_, idx) => idx !== i)));
+  }
+
+  const editTotal = editLines.reduce((s, l) => s + (Number(l.qty) || 0) * (Number(l.cost) || 0), 0);
+
+  async function saveEdit(e) {
+    if (e) e.preventDefault();
+    if (editSaving) return;
+    if (!editVendorId) { toast('Select a vendor.', 'error'); return; }
+    if (!editDate) { toast('Select a purchase date.', 'error'); return; }
+    const used = editLines.filter((l) => l.productId);
+    if (used.length === 0) { toast('Add at least one product line.', 'error'); return; }
+    for (const l of used) {
+      const prod = products.find((x) => String(x.id) === String(l.productId));
+      const sized = (prod?.variants || []).filter((v) => v.active).length > 0;
+      if (sized && !l.variantId) { toast(`Select a size for \"${prod?.name}\".`, 'error'); return; }
+      if (!Number(l.qty) || Number(l.qty) <= 0) { toast('Every line needs a quantity above zero.', 'error'); return; }
+      if (Number(l.cost) === null || Number.isNaN(Number(l.cost)) || Number(l.cost) < 0) { toast('Every line needs a valid cost.', 'error'); return; }
+    }
+    const payloadItems = used.map((l) => ({
+      productId: Number(l.productId),
+      variantId: l.variantId ? Number(l.variantId) : null,
+      qty: Number(l.qty),
+      cost: Number(l.cost),
+      batchNo: l.batchNo?.trim() || null,
+      expiryDate: l.expiryDate || null,
+    }));
+    const paidSoFar = Number(purchase.paid || 0);
+    const newTotal = payloadItems.reduce((s, i) => s + i.qty * i.cost, 0);
+    if (newTotal < paidSoFar - 0.005) {
+      toast(`New total ${formatMoney(newTotal, currency)} is below already paid ${formatMoney(paidSoFar, currency)}. Remove a payment or increase the total.`, 'error');
+      return;
+    }
+    if (!window.confirm(`Save changes? Total will become ${formatMoney(newTotal, currency)}. Stock will be corrected (old effect reversed, new applied).`)) return;
+    setEditSaving(true);
+    try {
+      await api(`/api/purchases/${purchaseId}`, { method: 'PUT', body: { vendorId: Number(editVendorId), date: editDate, notes: editNotes.trim(), items: payloadItems } });
+      toast('Purchase updated. Stock and payables corrected.');
+      setShowEdit(false);
+      load();
+    } catch (err) {
+      toast(err.message, 'error');
+    } finally {
+      setEditSaving(false);
+    }
+  }
 
   async function addPayment(e) {
     if (e) e.preventDefault();
@@ -176,7 +268,7 @@ export default function PurchaseDetailClient({ purchaseId, settings }) {
         back={{ href: '/admin/purchases', label: 'Purchases' }}
         title={`Purchase #${purchase.id}`}
         sub={`${purchase.vendor_name} · ${formatDate(purchase.purchase_date, tz)} · due ${formatDate(purchase.due_date, tz)}`}
-        actions={<Badge tone={st.tone}>{st.label}</Badge>}
+        actions={<div className="flex items-center gap-2"><Badge tone={st.tone}>{st.label}</Badge><Button variant="secondary" size="sm" onClick={openEdit}><IconPencil className="w-3.5 h-3.5" /> Edit</Button></div>}
       />
 
       {/* Money summary */}
@@ -276,6 +368,77 @@ export default function PurchaseDetailClient({ purchaseId, settings }) {
             : 'Attach the vendor invoice (JPG, PNG, WebP or PDF, max 4 MB).'}
         </div>
       </Card>
+
+      {showEdit && (
+        <Modal
+          title={`Edit Purchase #${purchase.id}`}
+          wide
+          onClose={() => setShowEdit(false)}
+          footer={
+            <>
+              <div className="flex-1 text-sm text-stone-600">New total: <span className="font-semibold tabular-nums text-stone-900">{formatMoney(editTotal, currency)}</span> {Number(purchase.paid) > 0 && <span className="text-xs text-stone-500">· already paid {formatMoney(purchase.paid, currency)}</span>}</div>
+              <Button variant="secondary" onClick={() => setShowEdit(false)}>Cancel</Button>
+              <Button loading={editSaving} onClick={saveEdit}>Save Changes</Button>
+            </>
+          }
+        >
+          <div className="space-y-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+              <Select label="Vendor" value={editVendorId} onChange={(e) => setEditVendorId(e.target.value)} required>
+                <option value="">Select vendor</option>
+                {vendors.map((v) => <option key={v.id} value={v.id}>{v.name}</option>)}
+              </Select>
+              <Input label="Date" type="date" value={editDate} onChange={(e) => setEditDate(e.target.value)} required />
+            </div>
+            <div>
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-sm font-medium text-stone-700">Items</span>
+                <Button variant="ghost" size="sm" onClick={addEditLine}><IconPlus className="w-3.5 h-3.5" /> Add Line</Button>
+              </div>
+              <div className="space-y-3">
+                {editLines.map((l, i) => {
+                  const prod = products.find((x) => String(x.id) === String(l.productId));
+                  const variants = (prod?.variants || []).filter((v) => v.active);
+                  const hasVariants = variants.length > 0;
+                  return (
+                    <div key={i} className="grid grid-cols-12 gap-2 items-end border border-line rounded-md p-2.5 bg-cream/30">
+                      <div className="col-span-12 sm:col-span-4">
+                        <Select label="Product" value={l.productId} onChange={(e) => setEditLine(i, 'productId', e.target.value)} required>
+                          <option value="">Select product</option>
+                          {products.map((p2) => <option key={p2.id} value={p2.id}>{p2.name}</option>)}
+                        </Select>
+                      </div>
+                      <div className="col-span-6 sm:col-span-2">
+                        <Select label="Size" value={l.variantId} onChange={(e) => setEditLine(i, 'variantId', e.target.value)} disabled={!hasVariants}>
+                          <option value="">{hasVariants ? 'Select size' : 'No sizes'}</option>
+                          {variants.map((v) => <option key={v.id} value={v.id}>{v.name} — {formatMoney(v.price, currency)}</option>)}
+                        </Select>
+                      </div>
+                      <div className="col-span-3 sm:col-span-1">
+                        <Input label="Qty" type="number" min="0.01" step="0.01" value={l.qty} onChange={(e) => setEditLine(i, 'qty', e.target.value)} required />
+                      </div>
+                      <div className="col-span-3 sm:col-span-2">
+                        <Input label={`Cost (${currency})`} type="number" min="0" step="0.01" value={l.cost} onChange={(e) => setEditLine(i, 'cost', e.target.value)} required />
+                      </div>
+                      <div className="col-span-5 sm:col-span-2">
+                        <Input label="Batch No." value={l.batchNo} onChange={(e) => setEditLine(i, 'batchNo', e.target.value)} placeholder="Optional" />
+                      </div>
+                      <div className="col-span-5 sm:col-span-2">
+                        <Input label="Expiry" type="date" value={l.expiryDate} onChange={(e) => setEditLine(i, 'expiryDate', e.target.value)} />
+                      </div>
+                      <div className="col-span-2 sm:col-span-1 flex justify-end">
+                        <button onClick={() => removeEditLine(i)} className="p-2 rounded text-stone-400 hover:text-red-600 hover:bg-red-50" aria-label="Remove line"><IconTrash className="w-4 h-4" /></button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+              <p className="mt-2 text-xs text-stone-500">The old stock effect will be reversed and the new one applied transactionally. Final stock = old stock − old qty + new qty (not old + new). Vendor ledger, payables, reports and dashboard update automatically.</p>
+            </div>
+            <Input label="Notes" value={editNotes} onChange={(e) => setEditNotes(e.target.value)} placeholder="Optional" maxLength={300} />
+          </div>
+        </Modal>
+      )}
 
       <p className="mt-3 text-xs text-stone-400">
         Recorded {formatDate(purchase.created_at, tz)} at {formatTime(purchase.created_at, tz)} by {purchase.created_by_name || '—'}.
