@@ -104,6 +104,11 @@ export async function POST(req) {
     normalized.push({ productId, qty: round2(qty), cost: round2(cost), variantId, expiryDate, batchNo });
   }
 
+  const totalCheck = round2(normalized.reduce((s, i) => s + i.qty * i.cost, 0));
+  if (totalCheck > 999_999_999.99) {
+    return fail('Purchase total exceeds the maximum allowed amount.');
+  }
+
   const vendorRows = await query('SELECT id, active FROM vendors WHERE id = $1', [vendorId]);
   const vendor = vendorRows[0];
   if (!vendor) return fail('Vendor not found.', 404);
