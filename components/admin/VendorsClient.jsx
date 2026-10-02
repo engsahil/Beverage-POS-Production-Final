@@ -1,5 +1,9 @@
 'use client';
 // Vendors: add, edit, enable/disable + accounting-style ledger per vendor.
+// Vendor opening balance follows the customer opening-balance pattern but
+// fits the derived vendor ledger (column on vendors, not a second ledger
+// table) — creation, persistence, ledger history, payables, running balance,
+// decimals, zero (clear), invalid inputs and auditability are all covered.
 import { useCallback, useEffect, useState } from 'react';
 import { api } from '@/lib/api-client';
 import { formatMoney, daysAgoStr, storeDateStr } from '@/lib/format';
@@ -24,6 +28,13 @@ export default function VendorsClient({ settings }) {
   const [ledger, setLedger] = useState(null);
   const [ledgerError, setLedgerError] = useState('');
   const [lf, setLf] = useState({ from: daysAgoStr(89), to: storeDateStr(settings?.timezone), type: 'all', method: '' });
+
+  // Opening balance modal state
+  const [obModal, setObModal] = useState(null); // vendor
+  const [obAmount, setObAmount] = useState('');
+  const [obNote, setObNote] = useState('');
+  const [obDate, setObDate] = useState('');
+  const [obSaving, setObSaving] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -98,9 +109,55 @@ export default function VendorsClient({ settings }) {
     loadLedger();
   }, [loadLedger]);
 
+  async function openOb(v) {
+    setObModal(v);
+    setObAmount(v.opening_balance ? String(Number(v.opening_balance).toFixed(2)) : '');
+    setObNote('');
+    setObDate(v.opening_balance_date ? String(v.opening_balance_date).slice(0, 10) : '');
+    try {
+      const d = await api(`/api/vendors/${v.id}/opening-balance`);
+      setObAmount(d.opening_balance ? String(Number(d.opening_balance).toFixed(2)) : '');
+      setObNote(d.opening_balance_note || '');
+      setObDate(d.opening_balance_date ? String(d.opening_balance_date).slice(0, 10) : '');
+    } catch {}
+  }
+
+  async function saveOb(e) {
+    if (e) e.preventDefault();
+    if (obSaving) return;
+    const amt = obAmount.trim() === '' ? null : Number(obAmount);
+    if (amt === null || Number.isNaN(amt) || amt < 0) {
+      toast('Enter an opening balance of 0 or more (0 clears it).', 'error');
+      return;
+    }
+    if (amt > 999999999.99) {
+      toast('Opening balance is too large (max 999,999,999.99).', 'error');
+      return;
+    }
+    setObSaving(true);
+    try {
+      const d = await api(`/api/vendors/${obModal.id}/opening-balance`, {
+        method: 'PUT',
+        body: { amount: amt, note: obNote.trim(), date: obDate || null },
+      });
+      toast(amt === 0 ? 'Opening balance cleared.' : `Opening balance ${formatMoney(d.opening_balance, currency)} saved.`);
+      setObModal(null);
+      load();
+      if (ledgerVendor && ledgerVendor.id === obModal.id) loadLedger();
+    } catch (err) {
+      toast(err.message, 'error');
+    } finally {
+      setObSaving(false);
+    }
+  }
+
   const columns = [
     { key: 'name', label: 'Name', render: (r) => <span className="font-medium text-stone-800">{r.name}</span> },
     { key: 'phone', label: 'Phone', render: (r) => r.phone || '—' },
+    { key: 'opening', label: 'Opening', align: 'right', className: 'tabular-nums', render: (r) => {
+      const ob = Number(r.opening_balance || 0);
+      return ob > 0.005 ? <span className="text-stone-600">{formatMoney(ob, currency)}</span> : <span className="text-stone-300">—</span>;
+    } },
     { key: 'outstanding', label: 'Outstanding', align: 'right', className: 'font-semibold tabular-nums', render: (r) => {
       const o = Number(r.outstanding);
       return o > 0.005 ? <span className="text-amber-600">{formatMoney(o, currency)}</span> : <span className="text-stone-400">—</span>;
@@ -113,6 +170,9 @@ export default function VendorsClient({ settings }) {
       align: 'right',
       render: (r) => (
         <div className="flex items-center justify-end gap-1">
+          <button onClick={() => openOb(r)} className="px-2 py-1 rounded text-xs font-medium border border-stone-300 text-stone-600 hover:bg-cream" title="Opening balance">
+            OB
+          </button>
           <Button variant="ghost" size="sm" onClick={() => { setLf({ from: daysAgoStr(89), to: storeDateStr(settings?.timezone), type: 'all', method: '' }); setLedgerVendor(r); }}>
             <IconScale className="w-3.5 h-3.5" /> Ledger
           </Button>
@@ -263,6 +323,27 @@ export default function VendorsClient({ settings }) {
               </table>
             </div>
           )}
+        </Modal>
+      )}
+
+      {obModal && (
+        <Modal
+          title={`Opening Balance — ${obModal.name}`}
+          onClose={() => setObModal(null)}
+          footer={
+            <>
+              <Button variant="secondary" onClick={() => setObModal(null)}>Cancel</Button>
+              <Button loading={obSaving} onClick={saveOb}>Save</Button>
+            </>
+          }
+        >
+          <form onSubmit={saveOb} className="space-y-3.5">
+            <Input label={`Amount (${currency}) — 0 clears`} type="number" min="0" step="0.01" value={obAmount} onChange={(e) => setObAmount(e.target.value)} placeholder="e.g. 15000.00" />
+            <Input label="Date (optional)" type="date" value={obDate} onChange={(e) => setObDate(e.target.value)} />
+            <Input label="Note (optional)" value={obNote} onChange={(e) => setObNote(e.target.value)} maxLength={200} placeholder="Why this opening balance exists" />
+            <p className="text-xs text-stone-500">Opening balance is what you already owed this vendor before using this system. It appears in the ledger, outstanding and payables. Decimals are handled as money (2dp). Enter 0 to clear.</p>
+            <button type="submit" className="hidden" />
+          </form>
         </Modal>
       )}
     </div>

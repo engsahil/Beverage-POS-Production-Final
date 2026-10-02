@@ -89,7 +89,8 @@ export async function GET(req, { params }) {
               COALESCE(SUM(CASE WHEN s.payment_method = 'cash' THEN s.total END), 0) AS cash,
               COALESCE(SUM(CASE WHEN s.payment_method = 'card' THEN s.total END), 0) AS card,
               COALESCE(SUM(CASE WHEN s.payment_method = 'other' THEN s.total END), 0) AS other,
-              COALESCE(SUM(s.discount), 0) AS discount
+              COALESCE(SUM(s.discount), 0) AS discount,
+              CASE WHEN COUNT(*) = 0 THEN 0 ELSE COALESCE(SUM(s.total), 0) / COUNT(*) END AS avg_order
        FROM sales s
       WHERE ${dateWhere}
       GROUP BY 1
@@ -102,6 +103,7 @@ export async function GET(req, { params }) {
         { key: 'date', label: 'Date' },
         { key: 'orders', label: 'Orders' },
         { key: 'sales', label: 'Sales' },
+        { key: 'avg_order', label: 'Avg Order' },
         { key: 'cash', label: 'Cash' },
         { key: 'card', label: 'Card' },
         { key: 'other', label: 'Other' },
@@ -111,6 +113,89 @@ export async function GET(req, { params }) {
         date: r.d instanceof Date ? r.d.toISOString().slice(0, 10) : String(r.d).slice(0, 10),
         orders: r.orders,
         sales: Number(r.sales),
+        avg_order: Number(r.avg_order),
+        cash: Number(r.cash),
+        card: Number(r.card),
+        other: Number(r.other),
+        discount: Number(r.discount),
+      })),
+    }, req);
+  }
+
+  if (type === 'weekly') {
+    const rows = await query(
+      `SELECT date_trunc('week', s.created_at AT TIME ZONE $1)::date AS d,
+              COUNT(*)::int AS orders,
+              COALESCE(SUM(s.total), 0) AS sales,
+              COALESCE(SUM(CASE WHEN s.payment_method = 'cash' THEN s.total END), 0) AS cash,
+              COALESCE(SUM(CASE WHEN s.payment_method = 'card' THEN s.total END), 0) AS card,
+              COALESCE(SUM(CASE WHEN s.payment_method = 'other' THEN s.total END), 0) AS other,
+              COALESCE(SUM(s.discount), 0) AS discount,
+              CASE WHEN COUNT(*) = 0 THEN 0 ELSE COALESCE(SUM(s.total), 0) / COUNT(*) END AS avg_order
+       FROM sales s
+      WHERE ${dateWhere}
+      GROUP BY 1
+      ORDER BY 1 DESC`,
+      baseParams
+    );
+    return okGzip({
+      range: { from: f, to: t },
+      columns: [
+        { key: 'week', label: 'Week' },
+        { key: 'orders', label: 'Orders' },
+        { key: 'sales', label: 'Sales' },
+        { key: 'avg_order', label: 'Avg Order' },
+        { key: 'cash', label: 'Cash' },
+        { key: 'card', label: 'Card' },
+        { key: 'other', label: 'Other' },
+        { key: 'discount', label: 'Discounts' },
+      ],
+      rows: rows.map((r) => ({
+        week: r.d instanceof Date ? r.d.toISOString().slice(0, 10) : String(r.d).slice(0, 10),
+        orders: r.orders,
+        sales: Number(r.sales),
+        avg_order: Number(r.avg_order),
+        cash: Number(r.cash),
+        card: Number(r.card),
+        other: Number(r.other),
+        discount: Number(r.discount),
+      })),
+    }, req);
+  }
+
+  if (type === 'monthly') {
+    const rows = await query(
+      `SELECT date_trunc('month', s.created_at AT TIME ZONE $1)::date AS d,
+              COUNT(*)::int AS orders,
+              COALESCE(SUM(s.total), 0) AS sales,
+              COALESCE(SUM(CASE WHEN s.payment_method = 'cash' THEN s.total END), 0) AS cash,
+              COALESCE(SUM(CASE WHEN s.payment_method = 'card' THEN s.total END), 0) AS card,
+              COALESCE(SUM(CASE WHEN s.payment_method = 'other' THEN s.total END), 0) AS other,
+              COALESCE(SUM(s.discount), 0) AS discount,
+              CASE WHEN COUNT(*) = 0 THEN 0 ELSE COALESCE(SUM(s.total), 0) / COUNT(*) END AS avg_order
+       FROM sales s
+      WHERE ${dateWhere}
+      GROUP BY 1
+      ORDER BY 1 DESC`,
+      baseParams
+    );
+    return okGzip({
+      range: { from: f, to: t },
+      columns: [
+        { key: 'month', label: 'Month' },
+        { key: 'orders', label: 'Orders' },
+        { key: 'sales', label: 'Sales' },
+        { key: 'avg_order', label: 'Avg Order' },
+        { key: 'cash', label: 'Cash' },
+        { key: 'card', label: 'Card' },
+        { key: 'other', label: 'Other' },
+        { key: 'discount', label: 'Discounts' },
+      ],
+      rows: rows.map((r) => ({
+        month: r.d instanceof Date ? r.d.toISOString().slice(0, 10) : String(r.d).slice(0, 10),
+        orders: r.orders,
+        sales: Number(r.sales),
+        avg_order: Number(r.avg_order),
         cash: Number(r.cash),
         card: Number(r.card),
         other: Number(r.other),

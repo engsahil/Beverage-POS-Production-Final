@@ -23,7 +23,7 @@ export async function GET() {
   // one costs a network round trip, so serialising them multiplied the
   // response time for no reason.
   const { sql, params } = accountBalanceQuery({ mode: 'all' });
-  const [acctRows, recvRows, invRows, pay] = await Promise.all([
+  const [acctRows, recvRows, invRows, pay, vendorOb] = await Promise.all([
     query(sql, params),
     // Receivables: customer outstanding (single stored column, maintained
     // transactionally by the credit-sale and payment routes).
@@ -45,6 +45,7 @@ export async function GET() {
       `SELECT (SELECT COALESCE(SUM(total), 0) FROM purchases) AS invoiced,
               (SELECT COALESCE(SUM(amount), 0) FROM purchase_payments) AS paid`
     ),
+    query('SELECT COALESCE(SUM(opening_balance), 0) AS ob FROM vendors'),
   ]);
   const acct = acctRows[0];
   const cash = Number(acct.cash);
@@ -52,7 +53,8 @@ export async function GET() {
   const card = Number(acct.card);
   const receivables = Number(recvRows[0].s);
   const inventory = Number(invRows[0].inventory);
-  const payables = round2(Number(pay[0].invoiced) - Number(pay[0].paid));
+  const vendorOpening = Number(vendorOb[0].ob || 0);
+  const payables = round2(Number(pay[0].invoiced) - Number(pay[0].paid) + vendorOpening);
 
   const assets = round2(cash + bank + card + receivables + inventory);
   const liabilities = round2(payables);
