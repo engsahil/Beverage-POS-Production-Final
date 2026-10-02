@@ -136,6 +136,18 @@ export default function PurchasesClient({ settings }) {
     }
   }
 
+  async function deletePurchaseRow(e, r) {
+    e.stopPropagation();
+    if (!window.confirm(`Delete Purchase #${r.id} from ${r.vendor_name}? This reverses the stock received.`)) return;
+    try {
+      await api(`/api/purchases/${r.id}`, { method: 'DELETE' });
+      toast('Purchase deleted and stock reconciled.');
+      load();
+    } catch (err) {
+      toast(err.message, 'error');
+    }
+  }
+
   const columns = [
     {
       key: 'purchase_date',
@@ -168,7 +180,23 @@ export default function PurchasesClient({ settings }) {
         return <Badge tone={s.tone}>{s.label}</Badge>;
       },
     },
-    { key: 'go', label: '', align: 'right', render: () => <IconChevronRight className="w-4 h-4 text-stone-400" /> },
+    {
+      key: 'go',
+      label: '',
+      align: 'right',
+      render: (r) => (
+        <div className="flex items-center justify-end gap-1">
+          <button
+            onClick={(e) => deletePurchaseRow(e, r)}
+            className="p-1.5 rounded text-stone-400 hover:text-red-600 hover:bg-red-50"
+            aria-label={`Delete purchase ${r.id}`}
+          >
+            <IconTrash className="w-4 h-4" />
+          </button>
+          <IconChevronRight className="w-4 h-4 text-stone-400" />
+        </div>
+      ),
+    },
   ];
 
   const filtered = purchases && statusFilter !== 'all' ? purchases.filter((p) => p.status === statusFilter) : purchases;

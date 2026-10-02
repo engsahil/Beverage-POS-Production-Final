@@ -98,26 +98,31 @@ export async function GET() {
       Number(r.total),
     ])
   );
-  const streak = { days: 0, goal: dailyGoal, active: dailyGoal > 0 };
-  if (dailyGoal > 0) {
-    // Date arithmetic in the BUSINESS timezone (the map keys are business
-    // dates); calendar math on date strings is timezone-free.
-    const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: tz });
-    const prevDay = (d) => {
-      const c = new Date(d + 'T00:00:00Z');
-      c.setUTCDate(c.getUTCDate() - 1);
-      return c.toISOString().slice(0, 10);
-    };
-    const meets = (d) => (salesByDay.get(d) || 0) >= dailyGoal;
-    let cursor = todayStr;
-    if (!meets(cursor)) cursor = prevDay(cursor);
-    while (meets(cursor)) {
-      streak.days += 1;
-      cursor = prevDay(cursor);
-    }
+  const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: tz });
+  const currentMonth = todayStr.slice(0, 7);
+  const prevDay = (d) => {
+    const c = new Date(d + 'T00:00:00Z');
+    c.setUTCDate(c.getUTCDate() - 1);
+    return c.toISOString().slice(0, 10);
+  };
+  const meets = (d) =>
+    dailyGoal > 0 ? (salesByDay.get(d) || 0) >= dailyGoal : (salesByDay.get(d) || 0) > 0;
+  let streakDays = 0;
+  let cursor = todayStr;
+  if (!meets(cursor)) cursor = prevDay(cursor);
+  while (meets(cursor)) {
+    streakDays += 1;
+    cursor = prevDay(cursor);
   }
+  const streak = {
+    days: streakDays,
+    goal: dailyGoal,
+    active: streakDays > 0 || dailyGoal > 0,
+  };
   const mtdTotal = Number(s.mtd_total);
   const todayTotal = Number(s.today_total);
+  const dailyPct = dailyGoal > 0 ? Math.min(100, Math.round((todayTotal / dailyGoal) * 1000) / 10) : null;
+  const monthlyPct = monthlyGoal > 0 ? Math.min(100, Math.round((mtdTotal / monthlyGoal) * 1000) / 10) : null;
   const lowStock = (s.low_stock_rows || []).map((r) => ({
     ...r,
     stock: Number(r.stock),
@@ -125,14 +130,22 @@ export async function GET() {
   }));
 
   return ok({
-    today: { orders: s.orders, sales: todayTotal },
+    today: { orders: s.orders, sales: todayTotal, date: todayStr },
     goals: {
-      daily: { goal: dailyGoal, sales: todayTotal, met: dailyGoal > 0 && todayTotal >= dailyGoal },
+      daily: {
+        goal: dailyGoal,
+        sales: todayTotal,
+        pct: dailyPct,
+        met: dailyGoal > 0 && todayTotal >= dailyGoal,
+      },
       streak,
       monthly: {
         goal: monthlyGoal,
         sales: mtdTotal,
+        remaining: monthlyGoal > 0 ? Math.max(0, monthlyGoal - mtdTotal) : 0,
+        pct: monthlyPct,
         met: monthlyGoal > 0 && mtdTotal >= monthlyGoal,
+        month: currentMonth,
       },
     },
     todayPurchases: { count: s.purchase_count, total: Number(s.purchase_total) },

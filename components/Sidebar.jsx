@@ -22,6 +22,7 @@ import {
   IconLogout,
   IconGlass,
   IconWallet,
+  IconScale,
 } from './icons';
 
 const ADMIN_NAV = [
@@ -33,6 +34,7 @@ const ADMIN_NAV = [
   { href: '/admin/purchases', label: 'Purchases', icon: IconTruck },
   { href: '/admin/vendors', label: 'Vendors', icon: IconUsers },
   { href: '/admin/customers', label: 'Customers', icon: IconUsers },
+  { href: '/admin/credit-dues', label: 'Credit & Dues', icon: IconScale },
   { href: '/admin/finance', label: 'Finance', icon: IconWallet },
   { href: '/admin/shifts', label: 'Shifts', icon: IconCalendar },
   { href: '/sales', label: 'Sales', icon: IconReceipt },

@@ -1,24 +1,11 @@
 // GET /api/finance/payables (admin)
-// Net vendor balances after invoices, payments, opening balances and settled
-// claims. A positive balance is payable; a negative balance is a vendor credit.
+// Net vendor balances after invoices, payments, opening balances (payable or
+// receivable) and settled claims.
 import { query } from '@/lib/db';
 import { requireAdmin } from '@/lib/auth';
 import { getSettings } from '@/lib/settings';
 import { ok, round2 } from '@/lib/validate';
 import { purchaseStatus } from '@/app/api/purchases/route.js';
-
-function emptyVendor(id, name) {
-  return {
-    vendor_id: id,
-    name,
-    outstanding: 0,
-    payable: 0,
-    receivable: 0,
-    overdue: 0,
-    invoices: 0,
-    claims: 0,
-  };
-}
 
 export async function GET() {
   const auth = await requireAdmin();
@@ -26,68 +13,73 @@ export async function GET() {
   const settings = await getSettings();
   const today = new Date().toLocaleDateString('sv-SE', { timeZone: settings.timezone });
 
-  const rows = await query(
-    `SELECT pr.id, pr.vendor_id, pr.purchase_date, pr.due_date, pr.total,
-            COALESCE((SELECT SUM(pp.amount) FROM purchase_payments pp WHERE pp.purchase_id = pr.id), 0) AS paid,
-            v.name AS vendor_name
-       FROM purchases pr
-       JOIN vendors v ON v.id = pr.vendor_id
-      ORDER BY pr.purchase_date, pr.id`
-  );
+  const [invRows, vendorRows] = await Promise.all([
+    query(
+      `SELECT pr.id, pr.vendor_id, v.name AS vendor_name, pr.purchase_date, pr.due_date, pr.total,
+              COALESCE((SELECT SUM(pp.amount) FROM purchase_payments pp WHERE pp.purchase_id = pr.id), 0) AS paid
+         FROM purchases pr
+         JOIN vendors v ON v.id = pr.vendor_id
+        ORDER BY pr.due_date ASC NULLS LAST, pr.id ASC`
+    ),
+    query(
+      `SELECT v.id, v.name, v.phone,
+              COALESCE(v.opening_balance, 0) AS opening_balance,
+              COALESCE(v.opening_balance_type, 'payable') AS opening_balance_type,
+              COALESCE((SELECT SUM(pr.total) FROM purchases pr WHERE pr.vendor_id = v.id), 0) AS purchases,
+              COALESCE((SELECT SUM(pp.amount) FROM purchase_payments pp WHERE pp.vendor_id = v.id), 0) AS payments,
+              COALESCE((SELECT SUM(vc.amount) FROM vendor_claims vc WHERE vc.vendor_id = v.id AND vc.status = 'settled'), 0) AS claims
+         FROM vendors v
+        ORDER BY v.name`
+    ),
+  ]);
 
-  const invoices = rows.map((r) => ({ ...purchaseStatus(r, today), vendor_name: r.vendor_name }));
-  const open = invoices.filter((i) => i.outstanding > 0.005);
+  const open = invRows
+    .map((r) => purchaseStatus(r, today))
+    .filter((r) => r.outstanding > 0.005);
 
-  const byVendor = new Map();
+  const invoiceStatsByVendor = new Map();
   for (const inv of open) {
-    const cur = byVendor.get(inv.vendor_id) || emptyVendor(inv.vendor_id, inv.vendor_name);
-    cur.outstanding = round2(cur.outstanding + inv.outstanding);
-    if (inv.status === 'overdue') cur.overdue = round2(cur.overdue + inv.outstanding);
+    const cur = invoiceStatsByVendor.get(inv.vendor_id) || { invoices: 0, overdue: 0 };
     cur.invoices += 1;
-    byVendor.set(inv.vendor_id, cur);
+    if (inv.status === 'overdue') cur.overdue = round2(cur.overdue + inv.outstanding);
+    invoiceStatsByVendor.set(inv.vendor_id, cur);
   }
 
-  // Carried-forward payables are not tied to an invoice due date.
-  const obRows = await query('SELECT id, name, opening_balance FROM vendors WHERE COALESCE(opening_balance, 0) > 0.005');
-  for (const v of obRows) {
-    const cur = byVendor.get(v.id) || emptyVendor(v.id, v.name);
-    cur.outstanding = round2(cur.outstanding + Number(v.opening_balance));
-    byVendor.set(v.id, cur);
-  }
+  const vendors = [];
+  for (const v of vendorRows) {
+    const ob = round2(Number(v.opening_balance || 0));
+    const obType = v.opening_balance_type === 'receivable' ? 'receivable' : 'payable';
+    const signedOb = obType === 'receivable' ? -ob : ob;
+    const purchases = round2(Number(v.purchases || 0));
+    const payments = round2(Number(v.payments || 0));
+    const claims = round2(Number(v.claims || 0));
+    const outstanding = round2(signedOb + purchases - payments - claims);
+    const payable = round2(Math.max(0, outstanding));
+    const receivable = round2(Math.max(0, -outstanding));
+    const invStat = invoiceStatsByVendor.get(v.id) || { invoices: 0, overdue: 0 };
+    const overdue = round2(Math.min(invStat.overdue, payable));
 
-  // A settled claim is a credit from the vendor. The vendor ledger already
-  // records it as a debit, so the point-in-time summary must subtract it too.
-  const claimRows = await query(
-    `SELECT v.id, v.name, COALESCE(SUM(vc.amount), 0) AS amount
-       FROM vendor_claims vc
-       JOIN vendors v ON v.id = vc.vendor_id
-      WHERE vc.status = 'settled'
-      GROUP BY v.id, v.name`
-  );
-  for (const v of claimRows) {
-    const cur = byVendor.get(v.id) || emptyVendor(v.id, v.name);
-    cur.claims = round2(Number(v.amount));
-    cur.outstanding = round2(cur.outstanding - cur.claims);
-    byVendor.set(v.id, cur);
-  }
-
-  const vendors = [...byVendor.values()]
-    .map((v) => {
-      const payable = round2(Math.max(v.outstanding, 0));
-      const receivable = round2(Math.max(-v.outstanding, 0));
-      return {
-        ...v,
+    if (payable > 0.005 || receivable > 0.005) {
+      vendors.push({
+        vendor_id: v.id,
+        name: v.name,
+        phone: v.phone || '',
+        opening_balance: ob,
+        opening_balance_type: obType,
+        purchases,
+        payments,
+        claims,
+        outstanding,
         payable,
         receivable,
-        // A vendor cannot have more overdue than its current net payable.
-        overdue: round2(Math.min(v.overdue, payable)),
-      };
-    })
-    .filter((v) => v.payable > 0.005 || v.receivable > 0.005)
-    .sort((a, b) => b.outstanding - a.outstanding);
+        overdue,
+        invoices: invStat.invoices,
+      });
+    }
+  }
 
-  const totalOpening = round2(obRows.reduce((s, r) => s + Number(r.opening_balance), 0));
-  const totalClaims = round2(claimRows.reduce((s, r) => s + Number(r.amount), 0));
+  vendors.sort((a, b) => b.outstanding - a.outstanding);
+
   const total = round2(vendors.reduce((s, v) => s + v.payable, 0));
   const receivableTotal = round2(vendors.reduce((s, v) => s + v.receivable, 0));
   const overdueTotal = round2(vendors.reduce((s, v) => s + v.overdue, 0));
@@ -96,9 +88,7 @@ export async function GET() {
     total,
     receivableTotal,
     overdueTotal,
-    totalOpening,
-    totalClaims,
     vendors,
-    invoices: open,
+    openInvoices: open,
   });
 }

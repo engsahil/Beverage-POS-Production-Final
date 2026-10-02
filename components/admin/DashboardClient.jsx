@@ -85,11 +85,11 @@ export default function DashboardClient({ settings }) {
         />
         <GoalCard
           title="Streak"
-          big={data.goals.streak.goal > 0 ? `${data.goals.streak.days} day${data.goals.streak.days === 1 ? '' : 's'}` : '—'}
+          big={`${data.goals.streak.days} day${data.goals.streak.days === 1 ? '' : 's'}`}
           sub={
             data.goals.streak.goal > 0
               ? `Consecutive days at or above the ${formatMoney(data.goals.streak.goal, currency)} daily goal`
-              : 'Set a daily sales goal to start a streak'
+              : 'Consecutive days with recorded sales activity'
           }
           pct={data.goals.daily.goal > 0 ? Math.min(100, (data.goals.daily.sales / data.goals.daily.goal) * 100) : null}
           met={data.goals.streak.days > 0}
@@ -231,7 +231,7 @@ function GoalCard({ title, big, sub, pct, met, flame }) {
         <span className="text-xs font-medium text-stone-500 uppercase tracking-wide">{title}</span>
         {met ? (
           <span className="inline-flex items-center gap-1 text-[11px] font-medium text-emerald-700 bg-emerald-50 border border-emerald-200 rounded px-1.5 py-0.5">
-            {flame ? 'On a streak' : 'Goal met'}
+            {flame ? 'On a streak' : pct !== null ? `${Math.round(pct)}% · Goal met` : 'Goal met'}
           </span>
         ) : (
           pct !== null && (

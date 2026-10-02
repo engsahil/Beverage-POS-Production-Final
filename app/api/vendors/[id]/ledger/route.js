@@ -1,25 +1,16 @@
 // GET /api/vendors/:id/ledger?from=&to=&method=&type= (admin)
 // Accounting-style vendor statement with a running balance.
 //
-//   credit  = invoice recorded (we now owe the vendor more)
-//   debit   = payment or settled claim (we owe less)
-//
-// Filters: from/to (date range on the row date), method (cash|bank|card,
-// applies to payments), type (all|invoices|payments|adjustments).
-// The opening balance is everything before `from`; every row in range
-// carries its balance after the row is applied. No stored balances —
-// everything is derived from the actual rows.
+//   credit  = increases what we owe the vendor (opening payable, purchase invoice)
+//   debit   = reduces what we owe / increases what vendor owes us (opening receivable, payment, settled claim)
+//   balance = credit - debit (> 0 means Payable [we owe vendor], < 0 means Receivable [vendor owes us])
 import { query } from '@/lib/db';
 import { requireAdmin } from '@/lib/auth';
 import { getSettings } from '@/lib/settings';
 import { validDate, fail, ok, round2 } from '@/lib/validate';
 
-// pg returns DATE as a JS Date (midnight UTC) — always serialize as ISO.
-const iso = (d) => (d instanceof Date ? d.toISOString().slice(0, 10) : String(d).slice(0, 10));
+const iso = (d) => (d instanceof Date ? d.toISOString().slice(0, 10) : d ? String(d).slice(0, 10) : '');
 
-// TIMESTAMPTZ (e.g. claim.settled_at) must be dated in the STORE timezone,
-// not UTC — a claim settled at 04:00 PKT (19th) is a 19th business event
-// even though UTC still shows the 18th. (sv-SE formats as YYYY-MM-DD.)
 const storeDate = (ts, tz) =>
   ts instanceof Date
     ? ts.toLocaleDateString('sv-SE', { timeZone: tz })
@@ -33,9 +24,18 @@ export async function GET(req, { params }) {
   const vendorId = Number((await params).id);
   if (!Number.isInteger(vendorId)) return fail('Invalid vendor id.', 404);
 
-  const vendorRow = await query('SELECT id, opening_balance, opening_balance_note, opening_balance_date, opening_balance_updated_at FROM vendors WHERE id = $1', [vendorId]);
-  if (!vendorRow[0]) return fail('Vendor not found.', 404);
-  const vendor = vendorRow[0];
+  const vendorRows = await query(
+    `SELECT id, name, phone, notes, active,
+            COALESCE(opening_balance, 0) AS opening_balance,
+            COALESCE(opening_balance_type, 'payable') AS opening_balance_type,
+            opening_balance_date,
+            COALESCE(opening_balance_note, '') AS opening_balance_note
+       FROM vendors
+      WHERE id = $1`,
+    [vendorId]
+  );
+  const vendor = vendorRows[0];
+  if (!vendor) return fail('Vendor not found.', 404);
 
   const sp = req.nextUrl.searchParams;
   const from = validDate(sp.get('from'));
@@ -48,131 +48,147 @@ export async function GET(req, { params }) {
   const settings = await getSettings();
   const today = new Date().toLocaleDateString('sv-SE', { timeZone: settings.timezone });
 
-  // Collect every balance-affecting row for this vendor.
-  const invoices = await query(
-    `SELECT pr.id, pr.purchase_date, pr.total,
-            (SELECT COUNT(*)::int FROM purchase_items pi WHERE pi.purchase_id = pr.id) AS item_count
-       FROM purchases pr WHERE pr.vendor_id = $1`,
-    [vendorId]
-  );
-  const payments = await query(
-    `SELECT pp.id, pp.payment_date, pp.amount, pp.method, pp.reference, pp.note
-       FROM purchase_payments pp WHERE pp.vendor_id = $1`,
-    [vendorId]
-  );
-  const claims = await query(
-    `SELECT vc.id, vc.settled_at, vc.amount, vc.adjustment_ref, vc.reason
-       FROM vendor_claims vc
-      WHERE vc.vendor_id = $1 AND vc.status = 'settled'`,
-    [vendorId]
-  );
+  const [invoices, payments, claims] = await Promise.all([
+    query(
+      `SELECT pr.id, pr.purchase_date, pr.total, pr.notes,
+              (SELECT COUNT(*)::int FROM purchase_items pi WHERE pi.purchase_id = pr.id) AS item_count
+         FROM purchases pr WHERE pr.vendor_id = $1`,
+      [vendorId]
+    ),
+    query(
+      `SELECT pp.id, pp.purchase_id, pp.payment_date, pp.amount, pp.method, pp.reference, pp.note
+         FROM purchase_payments pp WHERE pp.vendor_id = $1`,
+      [vendorId]
+    ),
+    query(
+      `SELECT vc.id, vc.settled_at, vc.claim_date, vc.amount, vc.adjustment_ref, vc.reason
+         FROM vendor_claims vc
+        WHERE vc.vendor_id = $1 AND vc.status = 'settled'`,
+      [vendorId]
+    ),
+  ]);
 
-  const rows = [];
-  // Vendor opening balance — a carried-forward payable that predates the
-  // purchases in this system. Treated as a credit (we owe more), dated on
-  // its explicit date or the vendor's creation date, and always part of
-  // the running balance. Mirrors the customer opening_balance ledger type
-  // but fits the derived vendor ledger (no second ledger table).
-  const ob = Number(vendor.opening_balance || 0);
-  if (ob > 0.005) {
-    const obDate = vendor.opening_balance_date ? iso(vendor.opening_balance_date) : null;
-    // Use a stable early date so the opening row sorts before purchases
-    // when no explicit date is stored; the ledger's opening calculation
-    // still counts it (it is added to `opening` below).
-    const dateForRow = obDate || '1970-01-01';
-    rows.push({
-      date: dateForRow,
-      reference: 'OPENING',
-      description: vendor.opening_balance_note ? `Opening balance — ${vendor.opening_balance_note}` : 'Opening balance',
-      type: 'invoices',
-      method: null,
-      credit: round2(ob),
-      debit: 0,
-      _isOpening: true,
-    });
-  }
+  const obAmount = round2(Number(vendor.opening_balance || 0));
+  const obType = vendor.opening_balance_type === 'receivable' ? 'receivable' : 'payable';
+  const signedOpening = round2(obType === 'receivable' ? -obAmount : obAmount);
+  const obDate = vendor.opening_balance_date ? iso(vendor.opening_balance_date) : null;
+
+  const allRows = [];
+  let totalPurchases = 0;
+  let totalPayments = 0;
+  let totalClaims = 0;
+
   for (const inv of invoices) {
-    rows.push({
+    const amt = round2(Number(inv.total));
+    totalPurchases = round2(totalPurchases + amt);
+    allRows.push({
+      id: `inv-${inv.id}`,
+      ref_id: inv.id,
       date: iso(inv.purchase_date),
       reference: `INV #${inv.id}`,
-      description: `Purchase, ${inv.item_count} item${inv.item_count === 1 ? '' : 's'}`,
+      description: `Purchase, ${inv.item_count} item${inv.item_count === 1 ? '' : 's'}${inv.notes ? ` — ${inv.notes}` : ''}`,
       type: 'invoices',
       method: null,
-      credit: Number(inv.total),
+      credit: amt,
       debit: 0,
     });
   }
   for (const p of payments) {
-    rows.push({
+    const amt = round2(Number(p.amount));
+    totalPayments = round2(totalPayments + amt);
+    allRows.push({
+      id: `pay-${p.id}`,
+      ref_id: p.id,
+      purchase_id: p.purchase_id,
       date: iso(p.payment_date),
       reference: p.reference || `PAY #${p.id}`,
       description: `Payment via ${p.method}${p.note ? ` — ${p.note}` : ''}`,
       type: 'payments',
       method: p.method,
       credit: 0,
-      debit: Number(p.amount),
+      debit: amt,
     });
   }
   for (const c of claims) {
-    rows.push({
-      date: storeDate(c.settled_at, settings.timezone),
+    const amt = round2(Number(c.amount));
+    totalClaims = round2(totalClaims + amt);
+    allRows.push({
+      id: `clm-${c.id}`,
+      ref_id: c.id,
+      date: storeDate(c.settled_at, settings.timezone) || iso(c.claim_date),
       reference: c.adjustment_ref || `CLM #${c.id}`,
       description: `Claim settled${c.reason ? ` — ${c.reason}` : ''}`,
       type: 'adjustments',
       method: null,
       credit: 0,
-      debit: Number(c.amount),
+      debit: amt,
     });
   }
-  rows.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+  allRows.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
 
-  // Opening balance for the range: opening_balance column + every row dated
-  // strictly before `from`. The closing is the opening plus every in-range row.
-  let opening = Number(vendor.opening_balance || 0);
-  // Add historical rows before `from`, but do not double-count the synthetic
-  // opening row (it is already in `opening` via the column).
-  for (const r of rows) {
-    if (r._isOpening) continue;
-    if (from && r.date && r.date < from) opening += r.credit - r.debit;
+  // Starting balance before `from`: vendor's carried-forward opening balance
+  // plus any transactions strictly before `from`.
+  let opening = signedOpening;
+  for (const r of allRows) {
+    if (from && r.date && r.date < from) {
+      opening = round2(opening + r.credit - r.debit);
+    }
   }
-  opening = round2(opening);
 
-  // In-range rows, filtered, with running balance.
-  // The synthetic opening row is shown when it falls in range (or when no `from`).
   let balance = opening;
-  // If the synthetic opening row is dated before `from`, it is already counted
-  // in `opening` and must not be emitted again; otherwise start the ledger
-  // with the stored opening balance already in `balance` and emit the row
-  // with a 0 delta (so the table shows the opening entry).
-  // Simpler: emit the synthetic row only when it is in range; its credit is
-  // NOT added again to `balance` because `balance` already contains it.
   const out = [];
-  for (const r of rows) {
+  for (const r of allRows) {
     if (!r.date) continue;
     if (from && r.date < from) continue;
     if (to && r.date > to) continue;
     if (type !== 'all' && r.type !== type) continue;
     if (method && r.type === 'payments' && r.method !== method) continue;
-    if (r._isOpening) {
-      // Opening row: balance is the opening itself (already in `balance`),
-      // not opening + credit again.
-      out.push({ date: r.date === '1970-01-01' ? '' : r.date, reference: r.reference, description: r.description, type: r.type, method: r.method, credit: r.credit, debit: r.debit, balance: round2(opening) });
-      continue;
-    }
     balance = round2(balance + r.credit - r.debit);
-    out.push({ ...r, balance });
+    out.push({
+      ...r,
+      balance,
+      payable: round2(Math.max(0, balance)),
+      receivable: round2(Math.max(0, -balance)),
+    });
   }
-  // When no synthetic opening row was emitted but we still carry an opening
-  // balance (e.g. filtered out by date/type), the closing must still reflect it.
-  // `balance` already does; `opening` is the correct opening.
+
+  const closing = round2(balance);
+  const payable = round2(Math.max(0, closing));
+  const receivable = round2(Math.max(0, -closing));
+
+  const accountClosing = round2(signedOpening + totalPurchases - totalPayments - totalClaims);
+  const accountPayable = round2(Math.max(0, accountClosing));
+  const accountReceivable = round2(Math.max(0, -accountClosing));
 
   return ok({
+    vendor: {
+      id: vendor.id,
+      name: vendor.name,
+      opening_balance: obAmount,
+      opening_balance_type: obType,
+      opening_balance_date: obDate,
+      opening_balance_note: vendor.opening_balance_note || '',
+    },
     opening,
-    closing: round2(balance),
+    closing,
+    payable,
+    receivable,
     today,
-    opening_balance: round2(Number(vendor.opening_balance || 0)),
-    opening_balance_note: vendor.opening_balance_note || '',
-    opening_balance_date: vendor.opening_balance_date ? iso(vendor.opening_balance_date) : null,
+    summary: {
+      opening_balance: obAmount,
+      opening_balance_type: obType,
+      opening_payable: obType === 'payable' ? obAmount : 0,
+      opening_receivable: obType === 'receivable' ? obAmount : 0,
+      signed_opening: signedOpening,
+      purchases: totalPurchases,
+      payments: totalPayments,
+      claims: totalClaims,
+      total_credit: round2((obType === 'payable' ? obAmount : 0) + totalPurchases),
+      total_debit: round2((obType === 'receivable' ? obAmount : 0) + totalPayments + totalClaims),
+      closing: accountClosing,
+      payable: accountPayable,
+      receivable: accountReceivable,
+    },
     rows: out,
   });
 }
