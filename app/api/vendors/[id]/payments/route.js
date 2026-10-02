@@ -88,24 +88,23 @@ export async function POST(req, { params }) {
       let linkedPurchaseId = null;
       if (purchaseId) {
         const prRes = await client.query(
-          'SELECT id, total FROM purchases WHERE id = $1 AND vendor_id = $2 FOR UPDATE',
+          `SELECT pr.id, pr.total,
+                  COALESCE((SELECT SUM(pp.amount) FROM purchase_payments pp WHERE pp.purchase_id = pr.id), 0) AS paid
+             FROM purchases pr
+            WHERE pr.id = $1 AND pr.vendor_id = $2
+            FOR UPDATE`,
           [purchaseId, vendorId]
         );
-        if (!prRes.rows[0]) throw new HttpError('Selected purchase not found for this vendor.', 404);
+        const prRow = prRes.rows[0];
+        if (!prRow) throw new HttpError('Selected purchase not found for this vendor.', 404);
+        const rem = round2(Number(prRow.total) - Number(prRow.paid));
+        if (amount > rem + 0.005) {
+          throw new HttpError(
+            `Payment exceeds the selected purchase's remaining balance (${rem.toFixed(2)}).`,
+            400
+          );
+        }
         linkedPurchaseId = purchaseId;
-      } else {
-        // If there is a single open purchase that can absorb this payment, link it;
-        // otherwise record as a vendor-level payment (purchase_id = NULL).
-        const openPr = await client.query(
-          `SELECT pr.id,
-                  pr.total - COALESCE((SELECT SUM(pp.amount) FROM purchase_payments pp WHERE pp.purchase_id = pr.id), 0) AS rem
-             FROM purchases pr
-            WHERE pr.vendor_id = $1
-            ORDER BY pr.purchase_date ASC, pr.id ASC`,
-          [vendorId]
-        );
-        const match = openPr.rows.find((r) => Number(r.rem) >= amount - 0.005);
-        if (match) linkedPurchaseId = match.id;
       }
 
       const ins = await client.query(
