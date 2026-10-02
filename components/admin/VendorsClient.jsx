@@ -158,9 +158,11 @@ export default function VendorsClient({ settings }) {
       const ob = Number(r.opening_balance || 0);
       return ob > 0.005 ? <span className="text-stone-600">{formatMoney(ob, currency)}</span> : <span className="text-stone-300">—</span>;
     } },
-    { key: 'outstanding', label: 'Outstanding', align: 'right', className: 'font-semibold tabular-nums', render: (r) => {
+    { key: 'outstanding', label: 'Balance', align: 'right', className: 'font-semibold tabular-nums', render: (r) => {
       const o = Number(r.outstanding);
-      return o > 0.005 ? <span className="text-amber-600">{formatMoney(o, currency)}</span> : <span className="text-stone-400">—</span>;
+      if (o > 0.005) return <span className="text-amber-600">{formatMoney(o, currency)}</span>;
+      if (o < -0.005) return <span className="text-blue-600">Receivable {formatMoney(Math.abs(o), currency)}</span>;
+      return <span className="text-stone-400">—</span>;
     } },
     { key: 'notes', label: 'Notes', render: (r) => <span className="text-stone-500">{r.notes || '—'}</span> },
     { key: 'active', label: 'Status', render: (r) => <Badge tone={r.active ? 'ok' : 'muted'}>{r.active ? 'Active' : 'Disabled'}</Badge> },

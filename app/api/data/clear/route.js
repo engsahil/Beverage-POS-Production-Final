@@ -89,10 +89,10 @@ export async function POST(req) {
                       GROUP BY si.product_id) d`,
             [ids, auth.user.id]
           );
-          await client.query(
-            `DELETE FROM stock_movements WHERE reason = 'sale' AND ref_id = ANY($1::int[])`,
-            [ids]
-          );
+          // Keep the original negative sale movements as immutable stock
+          // history. The positive restoration rows above cancel them exactly.
+          // Removing both the sale movement and restoring stock would make the
+          // movement sum exceed the product's actual stock.
           await client.query('DELETE FROM sale_items WHERE sale_id = ANY($1::int[])', [ids]);
           await client.query('DELETE FROM sales WHERE id = ANY($1::int[])', [ids]);
         }

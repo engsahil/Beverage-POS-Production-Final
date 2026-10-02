@@ -1,5 +1,5 @@
 'use client';
-// Reports: six simple reports, CSV export and a copyable text summary.
+// Reports: daily, weekly, monthly and operational summaries with CSV export.
 import { useCallback, useEffect, useState } from 'react';
 import { api, downloadCsv } from '@/lib/api-client';
 import {  formatMoney, formatQty, localDateStr, daysAgoStr , storeDateStr } from '@/lib/format';
@@ -9,6 +9,8 @@ import { IconCopy, IconDownload } from '@/components/icons';
 
 const TABS = [
   { key: 'daily', label: 'Daily Sales' },
+  { key: 'weekly', label: 'Weekly Sales' },
+  { key: 'monthly', label: 'Monthly Sales' },
   { key: 'range', label: 'Date Range' },
   { key: 'cashiers', label: 'Sales by Cashier' },
   { key: 'products', label: 'Product Sales' },
@@ -51,7 +53,7 @@ export default function ReportsClient({ settings }) {
 
   // Render helper that knows which cells are money values.
   function cell(r, key) {
-    const moneyKeys = ['sales', 'cash', 'card', 'other', 'discount', 'total', 'value', 'revenue', 'stock_value'];
+    const moneyKeys = ['sales', 'cash', 'card', 'other', 'discount', 'total', 'value', 'revenue', 'stock_value', 'avg_order'];
     if (moneyKeys.includes(key)) return money(r[key]);
     if (['stock', 'min_stock', 'qty_sold', 'cost'].includes(key)) return formatQty(r[key]);
     return r[key];
@@ -142,10 +144,10 @@ export default function ReportsClient({ settings }) {
             columns={data.columns.map((c) => ({
               key: c.key,
               label: c.label,
-              align: ['orders', 'qty_sold', 'stock', 'min_stock', 'purchases', 'cash', 'card', 'other', 'discount', 'sales', 'total', 'value', 'revenue', 'cost'].includes(c.key)
+              align: ['orders', 'qty_sold', 'stock', 'min_stock', 'purchases', 'cash', 'card', 'other', 'discount', 'sales', 'total', 'value', 'revenue', 'cost', 'avg_order'].includes(c.key)
                 ? 'right'
                 : 'left',
-              className: ['sales', 'total', 'value', 'revenue'].includes(c.key) ? 'font-semibold tabular-nums' : 'tabular-nums',
+              className: ['sales', 'total', 'value', 'revenue', 'avg_order'].includes(c.key) ? 'font-semibold tabular-nums' : 'tabular-nums',
               render: (r) => cell(r, c.key),
             }))}
             rows={data.rows}

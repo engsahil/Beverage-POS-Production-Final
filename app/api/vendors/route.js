@@ -14,6 +14,7 @@ export async function GET(req) {
             COALESCE(v.opening_balance, 0)
               + COALESCE((SELECT SUM(pr.total) FROM purchases pr WHERE pr.vendor_id = v.id), 0)
               - COALESCE((SELECT SUM(pp.amount) FROM purchase_payments pp WHERE pp.vendor_id = v.id), 0)
+              - COALESCE((SELECT SUM(vc.amount) FROM vendor_claims vc WHERE vc.vendor_id = v.id AND vc.status = 'settled'), 0)
               AS outstanding
        FROM vendors v
       ORDER BY v.name`

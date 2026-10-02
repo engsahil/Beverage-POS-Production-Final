@@ -2,7 +2,7 @@
 // Finance hub: account balances (cash/bank/card) + Cash Flow, Profit &
 // Loss, Balance Sheet, Receivables, Payables. Every number is computed
 // from stored transactions — nothing here is a stored aggregate.
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { api } from '@/lib/api-client';
 import {  formatMoney, daysAgoStr, localDateStr , storeDateStr } from '@/lib/format';
 import { Badge, Card, ErrorBox, Loading, PageHeader } from '@/components/ui';
@@ -30,6 +30,7 @@ export default function FinanceClient({ settings }) {
   const [data, setData] = useState(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  const loadSequence = useRef(0);
 
   useEffect(() => {
     let alive = true;
@@ -47,6 +48,10 @@ export default function FinanceClient({ settings }) {
   }, []);
 
   const load = useCallback(async () => {
+    // A response for an older tab/date selection must never replace the data
+    // requested by the current selection. This can otherwise leave the active
+    // tab showing a permanent loading state even though its request succeeded.
+    const sequence = ++loadSequence.current;
     setLoading(true);
     setError('');
     try {
@@ -59,15 +64,16 @@ export default function FinanceClient({ settings }) {
         sp.set('to', to);
       }
       const d = await api(`/api/finance/${url}${sp.toString() ? `?${sp.toString()}` : ''}`);
-      setData(d);
+      if (sequence === loadSequence.current) setData(d);
     } catch (err) {
+      if (sequence !== loadSequence.current) return;
       if (err.status === 401) {
         window.location.href = '/login';
         return;
       }
       setError(err.message);
     } finally {
-      setLoading(false);
+      if (sequence === loadSequence.current) setLoading(false);
     }
   }, [tab, from, to]);
 
@@ -254,6 +260,7 @@ export default function FinanceClient({ settings }) {
                     <BSRow cur={currency} label="Bank" value={data.assets.bank} />
                     <BSRow cur={currency} label="Card" value={data.assets.card} />
                     <BSRow cur={currency} label="Customer receivables" value={data.assets.receivables} />
+                    <BSRow cur={currency} label="Vendor credits" value={data.assets.vendor_receivables || 0} />
                     <BSRow cur={currency} label="Inventory (current cost)" value={data.assets.inventory} />
                     <BSTotal cur={currency} label="Total assets" value={data.assets.total} />
                   </tbody>
@@ -335,17 +342,20 @@ export default function FinanceClient({ settings }) {
           {/* ===== PAYABLES ===== */}
           {tab === 'payables' && (
             <Card className="overflow-hidden">
-              <div className="px-4 py-3 border-b border-line flex items-center justify-between">
-                <h3 className="text-sm font-semibold text-stone-800">Vendor Payables</h3>
+              <div className="px-4 py-3 border-b border-line flex flex-wrap items-center justify-between gap-2">
+                <h3 className="text-sm font-semibold text-stone-800">Vendor Balances</h3>
                 <span className="text-sm text-stone-600">
                   Total you owe: <span className="font-bold tabular-nums text-amber-700">{formatMoney(data.total, currency)}</span>
+                  {data.receivableTotal > 0.005 && (
+                    <span className="ml-2 text-blue-700">Vendor credits: {formatMoney(data.receivableTotal, currency)}</span>
+                  )}
                   {data.overdueTotal > 0.005 && (
                     <span className="ml-2 text-red-600">(overdue: {formatMoney(data.overdueTotal, currency)})</span>
                   )}
                 </span>
               </div>
               {data.vendors.length === 0 ? (
-                <div className="py-10 text-center text-sm text-stone-400">You don't owe any vendor money.</div>
+                <div className="py-10 text-center text-sm text-stone-400">No outstanding vendor balances.</div>
               ) : (
                 <table className="w-full text-sm">
                   <thead>
@@ -353,7 +363,7 @@ export default function FinanceClient({ settings }) {
                       <th className="py-2.5 px-4 text-left text-xs font-semibold uppercase tracking-wide text-stone-500">Vendor</th>
                       <th className="py-2.5 px-4 text-right text-xs font-semibold uppercase tracking-wide text-stone-500">Open Invoices</th>
                       <th className="py-2.5 px-4 text-right text-xs font-semibold uppercase tracking-wide text-stone-500">Overdue</th>
-                      <th className="py-2.5 px-4 text-right text-xs font-semibold uppercase tracking-wide text-stone-500">Outstanding</th>
+                      <th className="py-2.5 px-4 text-right text-xs font-semibold uppercase tracking-wide text-stone-500">Balance</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -362,7 +372,9 @@ export default function FinanceClient({ settings }) {
                         <td className="py-2.5 px-4 font-medium text-stone-800">{v.name}</td>
                         <td className="py-2.5 px-4 text-right tabular-nums text-stone-600">{v.invoices}</td>
                         <td className="py-2.5 px-4 text-right tabular-nums">{v.overdue > 0.005 ? <span className="text-red-600 font-medium">{formatMoney(v.overdue, currency)}</span> : <span className="text-stone-300">—</span>}</td>
-                        <td className="py-2.5 px-4 text-right tabular-nums font-semibold text-amber-700">{formatMoney(v.outstanding, currency)}</td>
+                        <td className={`py-2.5 px-4 text-right tabular-nums font-semibold ${v.outstanding < -0.005 ? 'text-blue-700' : 'text-amber-700'}`}>
+                          {v.outstanding < -0.005 ? `Receivable ${formatMoney(Math.abs(v.outstanding), currency)}` : formatMoney(v.outstanding, currency)}
+                        </td>
                       </tr>
                     ))}
                   </tbody>
